@@ -1,6 +1,6 @@
-# DreamZero-TPU
+# DreamZero-JAX
 
-JAX/Flax implementation of [DreamZero](https://github.com/dreamzero0/dreamzero) optimized for TPU inference and training.
+JAX/Flax implementation of [DreamZero](https://github.com/dreamzero0/dreamzero) for TPU/GPU inference and training.
 
 ## Project Overview
 
@@ -42,9 +42,9 @@ DreamZero is a **World Action Model** that jointly predicts actions and videos, 
 ## Directory Structure
 
 ```
-dreamzero-tpu/
-├── claude.md                 # This file
-├── dreamzero/
+dreamzero-jax/
+├── CLAUDE.md                 # This file
+├── dreamzero_jax/
 │   ├── __init__.py
 │   ├── models/
 │   │   ├── __init__.py
