@@ -49,37 +49,54 @@ DreamZero is a **World Action Model** that jointly predicts actions and videos, 
 
 ```
 dreamzero-jax/
-├── CLAUDE.md                 # This file
-├── dreamzero_jax/
-│   ├── __init__.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── dit.py            # DiT backbone in Flax
-│   │   ├── vae.py            # Video VAE
-│   │   ├── text_encoder.py   # Text encoder
-│   │   ├── image_encoder.py  # Image encoder
-│   │   ├── action_head.py    # Flow matching action head
-│   │   └── attention.py      # TPU-optimized attention
-│   ├── modules/
-│   │   ├── __init__.py
-│   │   ├── layers.py         # Common layers (norms, embeddings)
-│   │   └── schedulers.py     # Flow matching schedulers
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── dataset.py        # LeRobot dataset loader
-│   │   └── transforms.py     # Data transforms
-│   └── utils/
+├── CLAUDE.md
+├── pyproject.toml
+├── README.md
+│
+├── src/
+│   └── dreamzero_jax/
 │       ├── __init__.py
-│       ├── checkpoint.py     # PyTorch -> Flax weight conversion
-│       └── sharding.py       # TPU mesh sharding utilities
-├── configs/
-│   └── base.yaml             # Model configs
+│       │
+│       ├── nn/                     # Core neural network building blocks
+│       │   ├── __init__.py
+│       │   ├── attention.py        # Multi-head attention, causal attention
+│       │   ├── embed.py            # Positional embeddings, patch embed
+│       │   ├── mlp.py              # MLP, GLU variants
+│       │   └── norm.py             # RMSNorm, LayerNorm wrappers
+│       │
+│       ├── models/                 # High-level model architectures
+│       │   ├── __init__.py
+│       │   ├── dit.py              # DiT blocks, full DiT backbone
+│       │   ├── vae.py              # Video VAE encoder/decoder
+│       │   ├── text_encoder.py     # Text encoder (T5 wrapper)
+│       │   ├── image_encoder.py    # Image encoder (CLIP/SigLIP)
+│       │   ├── action_head.py      # Flow matching action head
+│       │   └── dreamzero.py        # Full DreamZero model
+│       │
+│       ├── schedulers/             # Diffusion schedulers
+│       │   ├── __init__.py
+│       │   ├── flow_matching.py    # Flow matching scheduler
+│       │   └── unipc.py            # UniPC multistep scheduler
+│       │
+│       ├── data/                   # Data loading
+│       │   ├── __init__.py
+│       │   ├── dataset.py          # LeRobot dataset
+│       │   └── transforms.py       # Video/action transforms
+│       │
+│       └── utils/
+│           ├── __init__.py
+│           ├── checkpoint.py       # PyTorch → Flax conversion
+│           └── sharding.py         # TPU mesh utilities
+│
 ├── scripts/
-│   ├── convert_checkpoint.py # Weight conversion script
-│   ├── inference.py          # TPU inference
-│   └── train.py              # TPU training
+│   ├── convert_checkpoint.py
+│   ├── inference.py
+│   └── train.py
+│
 └── tests/
-    └── test_models.py        # Model unit tests
+    ├── test_attention.py
+    ├── test_dit.py
+    └── test_vae.py
 ```
 
 ## JAX/TPU Considerations
