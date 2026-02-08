@@ -1,0 +1,40 @@
+[project]
+name = "dreamzero-jax"
+version = "0.1.0"
+description = "JAX/Flax implementation of DreamZero for TPU/GPU inference and training"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "jax[tpu]>=0.4.35",
+    "flax>=0.10.0",
+    "optax>=0.2.4",
+    "orbax-checkpoint>=0.9.0",
+    "grain>=0.2.0",
+    "transformers>=4.47.0",
+    "einops>=0.8.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+gpu = [
+    "jax[cuda12]>=0.4.35",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dreamzero_jax"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

@@ -1,6 +1,12 @@
 # DreamZero-JAX
 
-JAX/Flax implementation of [DreamZero](https://github.com/dreamzero0/dreamzero) for TPU/GPU inference and training.
+JAX/Flax NNX implementation of [DreamZero](https://github.com/dreamzero0/dreamzero) for TPU/GPU inference and training.
+
+## Code Style
+
+- **Flax NNX** (not Linen) for all neural network modules
+- Prefer `nnx.Module` subclasses with mutable state
+- Use `nnx.Rngs` for PRNG management
 
 ## Project Overview
 
@@ -107,8 +113,11 @@ optax
 orbax-checkpoint
 grain              # For data loading
 transformers       # For tokenizer
-tensorflow         # For tf.data (optional)
 ```
+
+## Package Manager
+
+This project uses **uv** for fast, reliable Python package management.
 
 ## Development Workflow
 
@@ -135,17 +144,17 @@ tensorflow         # For tf.data (optional)
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -e .
+# Create environment and install dependencies
+uv sync
 
 # Convert checkpoint
-python scripts/convert_checkpoint.py --input <pytorch_ckpt> --output <flax_ckpt>
+uv run python scripts/convert_checkpoint.py --input <pytorch_ckpt> --output <flax_ckpt>
 
 # Run inference
-python scripts/inference.py --checkpoint <flax_ckpt> --input <observation>
+uv run python scripts/inference.py --checkpoint <flax_ckpt> --input <observation>
 
 # Training
-python scripts/train.py --config configs/base.yaml
+uv run python scripts/train.py --config configs/base.yaml
 ```
 
 ## References
@@ -153,5 +162,5 @@ python scripts/train.py --config configs/base.yaml
 - [DreamZero Paper](https://dreamzero0.github.io/DreamZero.pdf)
 - [DreamZero GitHub](https://github.com/dreamzero0/dreamzero)
 - [JAX Documentation](https://jax.readthedocs.io/)
-- [Flax Documentation](https://flax.readthedocs.io/)
+- [Flax NNX Documentation](https://flax.readthedocs.io/en/latest/nnx/)
 - [TPU Best Practices](https://cloud.google.com/tpu/docs/best-practices)
