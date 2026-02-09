@@ -21,6 +21,31 @@ DreamZero is a **World Action Model** that jointly predicts actions and videos, 
 
 See **[.claude/](.claude/)** for implementation progress, decisions log, and per-component notes.
 
+### Maintaining .claude/ (auto-update rules)
+
+At **session start**, read `.claude/progress.md` to understand current project state.
+
+Update these files as you work — don't wait to be asked:
+
+- **`.claude/progress.md`** — Update when you:
+  - Complete a component (flip status to `done`, add notes)
+  - Start work on a component (flip to `in progress`)
+  - Discover a blocker or dependency not previously noted
+
+- **`.claude/decisions.md`** — Append an entry when you:
+  - Choose between multiple reasonable implementation approaches
+  - Deviate from the PyTorch reference in a non-trivial way
+  - Choose a specific library, API, or pattern for a reason worth remembering
+
+- **`.claude/context/<component>.md`** — Create or update when you:
+  - Start implementing a new component (capture key details from PyTorch source, dimension mappings, gotchas)
+  - Hit a non-obvious issue worth documenting for future sessions
+  - File name should match the module (e.g., `attention.md`, `dit.md`)
+
+Keep entries concise. Don't duplicate ARCHITECTURE.md — focus on implementation-specific details and rationale.
+
+Before a commit or at the end of a work session, run the `/wrap-up` skill to ensure all tracking files are current.
+
 ## Architecture Reference
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed documentation of the original PyTorch model:
