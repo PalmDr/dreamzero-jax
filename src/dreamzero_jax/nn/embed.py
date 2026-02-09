@@ -1,5 +1,7 @@
 """Embedding layers for DreamZero."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -324,3 +326,63 @@ def precompute_freqs_cis_3d(
     # Concatenate and convert to complex
     freqs = jnp.concatenate([freqs_t, freqs_h, freqs_w], axis=-1)
     return jnp.exp(1j * freqs)
+
+
+class WanRoPE3D:
+    """3D rotary embeddings with WAN-style dimension split.
+
+    Precomputes per-axis frequency tables at init.  Call with ``(f, h, w)``
+    to assemble grid-specific complex frequencies.
+
+    Dimension split (over complex pairs, i.e. ``d = head_dim // 2``):
+        dim_h = d // 3
+        dim_w = d // 3
+        dim_f = d - 2 * (d // 3)   # absorbs any remainder
+    """
+
+    def __init__(self, head_dim: int, max_len: int = 1024, theta: float = 10000.0):
+        self.head_dim = head_dim
+        d = head_dim // 2  # number of complex pairs
+
+        dim_h = d // 3
+        dim_w = d // 3
+        dim_f = d - 2 * dim_h
+        self.dim_f = dim_f
+        self.dim_h = dim_h
+        self.dim_w = dim_w
+
+        # Per-axis base frequencies — shape (dim_axis,)
+        self._freqs_f = 1.0 / (theta ** (jnp.arange(0, dim_f * 2, 2, dtype=jnp.float32) / (dim_f * 2)))
+        self._freqs_h = 1.0 / (theta ** (jnp.arange(0, dim_h * 2, 2, dtype=jnp.float32) / (dim_h * 2)))
+        self._freqs_w = 1.0 / (theta ** (jnp.arange(0, dim_w * 2, 2, dtype=jnp.float32) / (dim_w * 2)))
+
+        # Precompute position tables up to max_len — shape (max_len, dim_axis)
+        positions = jnp.arange(max_len, dtype=jnp.float32)
+        self._table_f = jnp.outer(positions, self._freqs_f)  # (max_len, dim_f)
+        self._table_h = jnp.outer(positions, self._freqs_h)  # (max_len, dim_h)
+        self._table_w = jnp.outer(positions, self._freqs_w)  # (max_len, dim_w)
+
+    def __call__(self, f: int, h: int, w: int) -> jax.Array:
+        """Assemble RoPE frequencies for a (f, h, w) grid.
+
+        Returns:
+            Complex array of shape ``(f * h * w, head_dim // 2)``.
+        """
+        # Slice precomputed tables to required lengths
+        freqs_f = self._table_f[:f]  # (f, dim_f)
+        freqs_h = self._table_h[:h]  # (h, dim_h)
+        freqs_w = self._table_w[:w]  # (w, dim_w)
+
+        # Broadcast each axis across the full grid using zero-copy views
+        # Target: (f, h, w, dim_axis) for each, then flatten to (f*h*w, dim_axis)
+        freqs_f = jnp.broadcast_to(freqs_f[:, None, None, :], (f, h, w, self.dim_f))
+        freqs_h = jnp.broadcast_to(freqs_h[None, :, None, :], (f, h, w, self.dim_h))
+        freqs_w = jnp.broadcast_to(freqs_w[None, None, :, :], (f, h, w, self.dim_w))
+
+        # Flatten spatial dims and concatenate axis frequencies
+        freqs_f = freqs_f.reshape(f * h * w, self.dim_f)
+        freqs_h = freqs_h.reshape(f * h * w, self.dim_h)
+        freqs_w = freqs_w.reshape(f * h * w, self.dim_w)
+
+        freqs = jnp.concatenate([freqs_f, freqs_h, freqs_w], axis=-1)  # (f*h*w, d)
+        return jnp.exp(1j * freqs)
