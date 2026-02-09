@@ -9,6 +9,17 @@ from dreamzero_jax.utils.checkpoint import (
     load_pytorch_checkpoint,
     save_flax_checkpoint,
 )
+from dreamzero_jax.utils.validation import (
+    DEFAULT_TOLERANCES,
+    ComponentResult,
+    compare_arrays,
+    format_report,
+    format_report_json,
+    load_fixture,
+    load_manifest,
+    save_fixture,
+    save_manifest,
+)
 from dreamzero_jax.utils.sharding import (
     AXIS_NAMES,
     DATA_AXIS,
@@ -36,6 +47,15 @@ __all__ = [
     "load_flax_checkpoint",
     "load_pytorch_checkpoint",
     "save_flax_checkpoint",
+    "DEFAULT_TOLERANCES",
+    "ComponentResult",
+    "compare_arrays",
+    "format_report",
+    "format_report_json",
+    "load_fixture",
+    "load_manifest",
+    "save_fixture",
+    "save_manifest",
     "AXIS_NAMES",
     "DATA_AXIS",
     "DATA_PARALLEL",

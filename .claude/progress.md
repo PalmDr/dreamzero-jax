@@ -46,6 +46,15 @@
 | Data transforms | `data/transforms.py` | done | ActionStats, DataConfig, normalize/denormalize video & actions, resize, center/random crop, prepare_batch. |
 | Training script | `scripts/train.py` | done | Full distributed training with AdamW + warmup cosine schedule, gradient accumulation, orbax checkpointing, wandb integration, dummy data fallback. ~748 lines. |
 
+## Numerical Validation
+
+| Component | File | Status | Notes |
+|-----------|------|--------|-------|
+| Validation utilities | `utils/validation.py` | done | ComponentResult, compare_arrays, load/save_fixture, format_report, DEFAULT_TOLERANCES for 10 components. |
+| PT fixture generator | `scripts/generate_pt_fixtures.py` | done | CLI to generate .npz reference outputs from PyTorch models. Supports --small, --components, --seed. 10 component generators. |
+| JAX validator script | `scripts/validate_against_pytorch.py` | done | CLI to compare JAX outputs against fixtures. Text/JSON output, --strict mode, per-component tolerance overrides. |
+| Parity tests | `tests/test_numerical_parity.py` | done | 10 pytest tests (one per component), graceful skip when no fixtures. Uses module-level skipif on manifest.json. |
+
 ## Phase 4: Optimization
 
 | Component | Status | Notes |
@@ -56,9 +65,10 @@
 
 ## Test Summary
 
-**128 tests passing** across 11 test files:
+**128 tests passing** across 11 test files + parity tests (skipped without fixtures):
 - Phase 1 core: test_mlp, test_embed, test_attention, test_dit, test_vae, test_text_encoder, test_image_encoder, test_action_head, test_dreamzero, test_schedulers (103 tests)
 - Phase 2/3: test_checkpoint (12 tests), test_sharding (7 tests), test_transforms (7 tests)
+- Validation: test_numerical_parity (10 tests, skip when no fixtures)
 
 ## Next Up
 
