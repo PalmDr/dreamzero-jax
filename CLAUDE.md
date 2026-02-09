@@ -17,6 +17,13 @@ DreamZero is a **World Action Model** that jointly predicts actions and videos, 
 - **Size**: 14B parameters (DROID checkpoint)
 - **Inference**: ~0.6s on GB200, ~3s on H100 with DiT caching
 
+## Architecture Reference
+
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed documentation of the original PyTorch model:
+- Component hyperparameters and dimensions
+- Data flow and module connections
+- PyTorch → JAX/Flax mapping table
+
 ## Architecture Components to Port
 
 ### Core Modules (`groot/vla/model/dreamzero/`)
@@ -59,10 +66,9 @@ dreamzero-jax/
 │       │
 │       ├── nn/                     # Core neural network building blocks
 │       │   ├── __init__.py
-│       │   ├── attention.py        # Multi-head attention, causal attention
-│       │   ├── embed.py            # Positional embeddings, patch embed
-│       │   ├── mlp.py              # MLP, GLU variants
-│       │   └── norm.py             # RMSNorm, LayerNorm wrappers
+│       │   ├── attention.py        # Causal/chunked attention (extends nnx.MultiHeadAttention)
+│       │   ├── embed.py            # Sinusoidal embeddings, RoPE, patch embed
+│       │   └── mlp.py              # MLP, SwiGLU, GeGLU
 │       │
 │       ├── models/                 # High-level model architectures
 │       │   ├── __init__.py
