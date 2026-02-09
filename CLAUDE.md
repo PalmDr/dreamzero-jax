@@ -17,6 +17,10 @@ DreamZero is a **World Action Model** that jointly predicts actions and videos, 
 - **Size**: 14B parameters (DROID checkpoint)
 - **Inference**: ~0.6s on GB200, ~3s on H100 with DiT caching
 
+## Progress & Context
+
+See **[.claude/](.claude/)** for implementation progress, decisions log, and per-component notes.
+
 ## Architecture Reference
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed documentation of the original PyTorch model:
