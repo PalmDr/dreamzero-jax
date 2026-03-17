@@ -183,7 +183,7 @@ class WanI2VCrossAttention(nnx.Module):
         if self.qk_norm:
             k_txt = self.norm_k_text(k_txt)
         k_txt = k_txt.reshape(B, -1, self.num_heads, self.head_dim)
-        v_txt = v_txt.reshape(B, -1, self.num_heads, self.head_dim)
+        v_txt = v_txt.reshape(B, -1, self.num_heads, self.head_dim).astype(q.dtype)
         out_txt = jax.nn.dot_product_attention(q, k_txt, v_txt)
 
         # Image attention
@@ -192,7 +192,7 @@ class WanI2VCrossAttention(nnx.Module):
         if self.qk_norm:
             k_img = self.norm_k_img(k_img)
         k_img = k_img.reshape(B, -1, self.num_heads, self.head_dim)
-        v_img = v_img.reshape(B, -1, self.num_heads, self.head_dim)
+        v_img = v_img.reshape(B, -1, self.num_heads, self.head_dim).astype(q.dtype)
         out_img = jax.nn.dot_product_attention(q, k_img, v_img)
 
         # Sum text + image attention, then project
@@ -222,12 +222,15 @@ class WanDiTBlock(nnx.Module):
         qk_norm: bool = True,
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
+        use_pallas: bool = False,
+        chunk_size: int | None = None,
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.has_image_input = has_image_input
+        self.use_pallas = use_pallas
 
         # Norms for self-attention and FFN (no affine — modulated externally)
         self.norm1 = nnx.LayerNorm(
@@ -242,9 +245,10 @@ class WanDiTBlock(nnx.Module):
         if cross_attn_norm:
             self.norm3 = nnx.LayerNorm(dim, rngs=rngs)
 
-        # Self-attention
+        # Self-attention (chunked when chunk_size is set and seq > chunk_size)
         self.self_attn = Attention(
             dim, num_heads, qk_norm=qk_norm, eps=eps,
+            chunk_size=chunk_size,
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
 
@@ -300,7 +304,11 @@ class WanDiTBlock(nnx.Module):
         gate_mlp = mod[:, 5]
 
         # Self-attention: norm -> modulate -> attn -> gated residual
-        h = self.norm1(x) * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
+        if self.use_pallas:
+            from dreamzero_jax.nn.pallas_ops import fused_adaln_modulate
+            h = fused_adaln_modulate(x, scale_msa, shift_msa)
+        else:
+            h = self.norm1(x) * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
         h = self.self_attn(h, freqs_cis=freqs_cis, mask=mask)
         x = x + h * gate_msa[:, None, :]
 
@@ -312,7 +320,11 @@ class WanDiTBlock(nnx.Module):
             x = x + self.cross_attn(h, context=context)
 
         # FFN: norm -> modulate -> ffn -> gated residual
-        h = self.norm2(x) * (1 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
+        if self.use_pallas:
+            from dreamzero_jax.nn.pallas_ops import fused_adaln_modulate
+            h = fused_adaln_modulate(x, scale_mlp, shift_mlp)
+        else:
+            h = self.norm2(x) * (1 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
         h = self.ffn(h)
         x = x + h * gate_mlp[:, None, :]
 
@@ -333,11 +345,13 @@ class WanDiTHead(nnx.Module):
         out_channels: int,
         patch_size: tuple[int, int, int],
         eps: float = 1e-6,
+        use_pallas: bool = False,
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
+        self.use_pallas = use_pallas
         patch_vol = patch_size[0] * patch_size[1] * patch_size[2]
         self.norm = nnx.LayerNorm(
             dim, use_bias=False, use_scale=False, epsilon=eps, rngs=rngs
@@ -364,7 +378,11 @@ class WanDiTHead(nnx.Module):
         shift = mod[:, 0]  # (B, dim)
         scale = mod[:, 1]
 
-        x = self.norm(x) * (1 + scale[:, None, :]) + shift[:, None, :]
+        if self.use_pallas:
+            from dreamzero_jax.nn.pallas_ops import fused_adaln_modulate
+            x = fused_adaln_modulate(x, scale, shift)
+        else:
+            x = self.norm(x) * (1 + scale[:, None, :]) + shift[:, None, :]
         return self.linear(x)
 
 
@@ -396,6 +414,8 @@ class WanDiT(nnx.Module):
         qk_norm: bool = True,
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
+        use_pallas: bool = False,
+        chunk_size: int | None = None,
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
@@ -451,6 +471,8 @@ class WanDiT(nnx.Module):
                 qk_norm=qk_norm,
                 cross_attn_norm=cross_attn_norm,
                 eps=eps,
+                use_pallas=use_pallas,
+                chunk_size=chunk_size,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 rngs=rngs,
@@ -461,6 +483,7 @@ class WanDiT(nnx.Module):
         # Output head
         self.head = WanDiTHead(
             dim, out_channels, patch_size, eps=eps,
+            use_pallas=use_pallas,
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
 

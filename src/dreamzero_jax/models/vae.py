@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -553,15 +555,15 @@ class Decoder3d(nnx.Module):
 # Pre-computed latent normalization vectors (z_dim=16).
 # These are derived from the DreamZero DROID checkpoint and are used to
 # normalize latents to approximately zero mean and unit variance.
-_LATENT_MEAN = jnp.array([
+_LATENT_MEAN = np.array([
     -0.7571, -0.7089, -0.9113, 0.0778, -0.5240, -0.8652, -0.5261, -0.0275,
     -0.3474, 0.0429, -0.2780, 0.0377, -0.2498, 0.0203, 0.0737, 0.5765,
-], dtype=jnp.float32)
+], dtype=np.float32)
 
-_LATENT_STD = jnp.array([
+_LATENT_STD = np.array([
     7.4687, 7.1546, 6.8892, 6.4774, 7.2596, 7.0694, 7.5413, 5.7266,
     7.2956, 6.6528, 7.0108, 5.6451, 6.4170, 5.3875, 5.7530, 6.5995,
-], dtype=jnp.float32)
+], dtype=np.float32)
 
 
 class WanVideoVAE(nnx.Module):

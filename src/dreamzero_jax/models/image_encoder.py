@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -272,8 +274,8 @@ class WanImageEncoder(nnx.Module):
     """
 
     # CLIP normalization constants
-    MEAN = jnp.array([0.48145466, 0.4578275, 0.40821073])
-    STD = jnp.array([0.26862954, 0.26130258, 0.27577711])
+    MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+    STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
     def __init__(
         self,

@@ -15,6 +15,7 @@ from dreamzero_jax.nn.embed import (
     apply_rotary_emb,
 )
 from dreamzero_jax.nn.attention import Attention, make_causal_mask, make_causal_chunk_mask
+from dreamzero_jax.nn.pallas_ops import fused_adaln_modulate
 
 __all__ = [
     "MLP",
@@ -34,4 +35,5 @@ __all__ = [
     "Attention",
     "make_causal_mask",
     "make_causal_chunk_mask",
+    "fused_adaln_modulate",
 ]

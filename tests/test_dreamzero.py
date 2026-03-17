@@ -176,3 +176,51 @@ def test_dreamzero_generate_output_type():
     assert isinstance(result, InferenceOutput)
     assert jnp.isfinite(result.action_pred).all()
     assert jnp.isfinite(result.video_pred).all()
+
+
+def test_dreamzero_generate_scan_output_type():
+    """generate_scan returns an InferenceOutput NamedTuple with finite values."""
+    cfg = _small_config()
+    model = _make_model(cfg)
+
+    video = jax.random.uniform(
+        jax.random.key(0), (BATCH, 5, IMAGE_H, IMAGE_W, 3), minval=-1, maxval=1,
+    )
+    ids = jnp.zeros((BATCH, TEXT_LEN), dtype=jnp.int32)
+
+    num_blocks = 2
+    state = jax.random.normal(jax.random.key(2), (BATCH, num_blocks, cfg.state_dim))
+    embodiment_id = jnp.array([0])
+
+    result = model.generate_scan(
+        video, ids, state, embodiment_id, key=jax.random.key(4),
+    )
+
+    assert isinstance(result, InferenceOutput)
+    assert jnp.isfinite(result.action_pred).all()
+    assert jnp.isfinite(result.video_pred).all()
+
+
+def test_dreamzero_generate_scan_shape_matches():
+    """generate_scan produces outputs with the same shapes as generate."""
+    cfg = _small_config()
+    model = _make_model(cfg)
+
+    video = jax.random.uniform(
+        jax.random.key(0), (BATCH, 5, IMAGE_H, IMAGE_W, 3), minval=-1, maxval=1,
+    )
+    ids = jnp.zeros((BATCH, TEXT_LEN), dtype=jnp.int32)
+
+    num_blocks = 2
+    state = jax.random.normal(jax.random.key(2), (BATCH, num_blocks, cfg.state_dim))
+    embodiment_id = jnp.array([0])
+
+    result_loop = model.generate(
+        video, ids, state, embodiment_id, key=jax.random.key(4),
+    )
+    result_scan = model.generate_scan(
+        video, ids, state, embodiment_id, key=jax.random.key(4),
+    )
+
+    assert result_scan.action_pred.shape == result_loop.action_pred.shape
+    assert result_scan.video_pred.shape == result_loop.video_pred.shape

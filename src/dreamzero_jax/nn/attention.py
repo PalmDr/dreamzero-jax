@@ -2,9 +2,95 @@
 
 import jax
 import jax.numpy as jnp
+import jax.lax as lax
 from flax import nnx
 
 from dreamzero_jax.nn.embed import apply_rotary_emb
+
+
+def _chunked_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    bias: jax.Array | None,
+    chunk_size: int,
+) -> jax.Array:
+    """Process attention in chunks along the query dimension.
+
+    Avoids materializing the full (q_len x kv_len) attention matrix by
+    splitting Q into chunks and running ``jax.nn.dot_product_attention``
+    independently for each chunk against the full K/V.
+
+    Args:
+        q: Query tensor ``(B, q_len, num_heads, head_dim)``.
+        k: Key tensor ``(B, kv_len, num_heads, head_dim)``.
+        v: Value tensor ``(B, kv_len, num_heads, head_dim)``.
+        bias: Optional additive attention bias ``(1|B, 1|N, q_len, kv_len)``.
+              Each chunk will receive its corresponding slice along the query dim.
+              If the query dim of the bias is 1 (broadcast), it is used as-is.
+        chunk_size: Number of query tokens per chunk.
+
+    Returns:
+        Output tensor ``(B, q_len, num_heads, head_dim)``.
+    """
+    B, q_len, num_heads, head_dim = q.shape
+
+    # Pad q_len to be divisible by chunk_size
+    pad_len = (chunk_size - q_len % chunk_size) % chunk_size
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        if bias is not None:
+            # bias shape: (1|B, 1|N, q_len, kv_len)
+            # Only pad query dim if it isn't broadcast (size 1)
+            if bias.shape[-2] > 1:
+                bias = jnp.pad(
+                    bias,
+                    ((0, 0), (0, 0), (0, pad_len), (0, 0)),
+                    constant_values=jnp.finfo(q.dtype).min,
+                )
+
+    padded_q_len = q_len + pad_len
+    num_chunks = padded_q_len // chunk_size
+
+    # Reshape Q into chunks: (B, num_chunks, chunk_size, num_heads, head_dim)
+    q_chunked = q.reshape(B, num_chunks, chunk_size, num_heads, head_dim)
+
+    # Prepare per-chunk bias slices (or None)
+    if bias is not None and bias.shape[-2] > 1:
+        # bias: (1|B, 1|N, padded_q_len, kv_len)
+        # -> (1|B, 1|N, num_chunks, chunk_size, kv_len)
+        bias_chunked = bias.reshape(
+            bias.shape[0], bias.shape[1], num_chunks, chunk_size, bias.shape[-1]
+        )
+    else:
+        bias_chunked = None
+
+    def _attend_one_chunk(i: int) -> jax.Array:
+        q_chunk = q_chunked[:, i]  # (B, chunk_size, num_heads, head_dim)
+        if bias_chunked is not None:
+            b_chunk = bias_chunked[:, :, i]  # (1|B, 1|N, chunk_size, kv_len)
+        elif bias is not None:
+            # Broadcast bias (query dim == 1), use as-is
+            b_chunk = bias
+        else:
+            b_chunk = None
+        return jax.nn.dot_product_attention(q_chunk, k, v, bias=b_chunk)
+
+    # Use lax.map to process chunks sequentially (avoids materializing all at once)
+    out_chunks = lax.map(
+        _attend_one_chunk,
+        jnp.arange(num_chunks),
+    )  # (num_chunks, B, chunk_size, num_heads, head_dim)
+
+    # Reassemble: (num_chunks, B, chunk_size, N, D) -> (B, padded_q_len, N, D)
+    out = out_chunks.transpose(1, 0, 2, 3, 4).reshape(
+        B, padded_q_len, num_heads, head_dim
+    )
+
+    # Remove padding
+    if pad_len > 0:
+        out = out[:, :q_len]
+    return out
 
 
 def make_causal_mask(seq_len: int, dtype: jnp.dtype = jnp.bool_) -> jax.Array:
@@ -71,6 +157,8 @@ class Attention(nnx.Module):
         out_bias: bool = True,
         qk_norm: bool = False,
         eps: float = 1e-6,
+        chunk_size: int | None = None,
+        use_splash: bool = False,
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
@@ -79,6 +167,8 @@ class Attention(nnx.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim or dim // num_heads
         self.qk_norm = qk_norm
+        self.chunk_size = chunk_size
+        self.use_splash = use_splash
 
         inner_dim = num_heads * self.head_dim
         kv_input_dim = context_dim if context_dim is not None else dim
@@ -164,9 +254,12 @@ class Attention(nnx.Module):
         # Apply rotary embeddings — freqs_cis is (seq_len, head_dim // 2).
         # apply_rotary_emb expects (..., seq_len, head_dim), so we transpose
         # to (B, num_heads, seq, head_dim) and back.
+        # Note: RoPE uses complex64 which promotes Q/K to float32.
+        # We cast V to match so dot_product_attention sees uniform dtypes.
         if freqs_cis is not None:
             q = apply_rotary_emb(q.transpose(0, 2, 1, 3), freqs_cis).transpose(0, 2, 1, 3)
             k = apply_rotary_emb(k.transpose(0, 2, 1, 3), freqs_cis).transpose(0, 2, 1, 3)
+            v = v.astype(q.dtype)
 
         # Convert boolean mask to additive bias for jax.nn.dot_product_attention.
         # Despite Q/K/V being (B, T, N, H), the bias is (B, N, T, S) internally.
@@ -189,8 +282,15 @@ class Attention(nnx.Module):
         else:
             bias = None
 
-        # jax.nn.dot_product_attention expects (B, T, N, H) layout
-        out = jax.nn.dot_product_attention(q, k, v, bias=bias)
+        # Dispatch to chunked or standard attention.
+        # Chunked attention splits Q into smaller chunks to avoid materializing
+        # the full (q_len x kv_len) attention matrix — critical for long
+        # video sequences that would otherwise OOM on TPU.
+        if self.chunk_size is not None and q_len > self.chunk_size:
+            out = _chunked_attention(q, k, v, bias, self.chunk_size)
+        else:
+            # jax.nn.dot_product_attention expects (B, T, N, H) layout
+            out = jax.nn.dot_product_attention(q, k, v, bias=bias)
 
         # Merge heads: (B, q_len, num_heads, head_dim) -> (B, q_len, inner_dim)
         out = out.reshape(B, q_len, self.num_heads * self.head_dim)
