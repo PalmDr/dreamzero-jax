@@ -48,6 +48,9 @@ from dreamzero_jax.models.dit import WanDiT, WanDiTBlock
 from dreamzero_jax.models.vae import WanVideoVAE
 from dreamzero_jax.models.action_head import CausalWanDiT
 from dreamzero_jax.models.dreamzero import DreamZero, DreamZeroConfig
+from dreamzero_jax.utils.sharding import create_mesh, shard_params, REPLICATED
+
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +190,7 @@ def bench_single_block(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark a single WanDiTBlock at 14B config."""
     dtype = resolve_dtype(dtype_str)
@@ -207,6 +211,11 @@ def bench_single_block(
         rngs=rngs,
     )
 
+    # Shard model weights across devices if mesh is provided
+    if mesh is not None:
+        print("  Sharding model weights across devices...")
+        block = shard_params(block, mesh)
+
     # Create dummy inputs
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4 = jax.random.split(key, 4)
@@ -218,6 +227,14 @@ def bench_single_block(
     # RoPE freqs: complex64, shape (SEQ_LEN, head_dim//2)
     head_dim = dim // CONFIG_14B["num_heads"]
     freqs_cis = jnp.ones((SEQ_LEN, head_dim // 2), dtype=jnp.complex64)
+
+    # Replicate inputs across all devices when sharding
+    if mesh is not None:
+        replicated = NamedSharding(mesh, P())
+        x = jax.device_put(x, replicated)
+        e = jax.device_put(e, replicated)
+        context = jax.device_put(context, replicated)
+        freqs_cis = jax.device_put(freqs_cis, replicated)
 
     @nnx.jit
     def run(model, x, e, context, freqs_cis):
@@ -238,14 +255,19 @@ def bench_full_dit(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,
+    use_scan: bool = False,
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
     dtype = resolve_dtype(dtype_str)
     dim = CONFIG_14B["dim"]
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
 
-    pallas_str = " [Pallas]" if use_pallas else ""
-    print(f"  Initializing WanDiT ({num_layers} layers, d={dim}){pallas_str}...")
+    flags = []
+    if use_pallas: flags.append("Pallas")
+    if use_scan: flags.append("Scan")
+    flag_str = f" [{', '.join(flags)}]" if flags else ""
+    print(f"  Initializing WanDiT ({num_layers} layers, d={dim}){flag_str}...")
     try:
         model = WanDiT(
             dim=dim,
@@ -260,6 +282,7 @@ def bench_full_dit(
             has_image_input=True,
             qk_norm=True,
             use_pallas=use_pallas,
+            use_scan=use_scan,
             dtype=dtype,
             param_dtype=dtype,
             rngs=rngs,
@@ -273,6 +296,11 @@ def bench_full_dit(
             )
         raise
 
+    # Shard model weights across devices if mesh is provided
+    if mesh is not None:
+        print("  Sharding model weights across devices...")
+        model = shard_params(model, mesh)
+
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4 = jax.random.split(key, 4)
     # Input: latent video (B, T, H, W, C)
@@ -280,6 +308,14 @@ def bench_full_dit(
     timestep = jnp.array([500.0] * batch_size, dtype=jnp.float32)
     context = jax.random.normal(k2, (batch_size, TEXT_SEQ_LEN, CONFIG_14B["text_dim"]), dtype=dtype)
     clip_emb = jax.random.normal(k3, (batch_size, 257, 1280), dtype=dtype)
+
+    # Replicate inputs across all devices when sharding
+    if mesh is not None:
+        replicated = NamedSharding(mesh, P())
+        x = jax.device_put(x, replicated)
+        timestep = jax.device_put(timestep, replicated)
+        context = jax.device_put(context, replicated)
+        clip_emb = jax.device_put(clip_emb, replicated)
 
     @nnx.jit
     def run(model, x, timestep, context, clip_emb):
@@ -300,6 +336,7 @@ def bench_vae_encode(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,  # unused, kept for API consistency
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark VAE encode: 33 frames @ 320x176."""
     dtype = resolve_dtype(dtype_str)
@@ -314,8 +351,17 @@ def bench_vae_encode(
         rngs=rngs,
     )
 
+    # Shard model weights across devices if mesh is provided
+    if mesh is not None:
+        print("  Sharding VAE weights across devices...")
+        vae = shard_params(vae, mesh)
+
     key = jax.random.PRNGKey(42)
     video = jax.random.normal(key, (batch_size, VIDEO_FRAMES, VIDEO_H, VIDEO_W, 3), dtype=dtype)
+
+    # Replicate inputs across all devices when sharding
+    if mesh is not None:
+        video = jax.device_put(video, NamedSharding(mesh, P()))
 
     @nnx.jit
     def run(model, video):
@@ -336,6 +382,7 @@ def bench_vae_decode(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,  # unused, kept for API consistency
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark VAE decode: latents -> 33 frames."""
     dtype = resolve_dtype(dtype_str)
@@ -350,10 +397,19 @@ def bench_vae_decode(
         rngs=rngs,
     )
 
+    # Shard model weights across devices if mesh is provided
+    if mesh is not None:
+        print("  Sharding VAE weights across devices...")
+        vae = shard_params(vae, mesh)
+
     key = jax.random.PRNGKey(42)
     latents = jax.random.normal(
         key, (batch_size, LATENT_T, LATENT_H, LATENT_W, LATENT_C), dtype=dtype,
     )
+
+    # Replicate inputs across all devices when sharding
+    if mesh is not None:
+        latents = jax.device_put(latents, NamedSharding(mesh, P()))
 
     @nnx.jit
     def run(model, latents):
@@ -374,6 +430,7 @@ def bench_full_inference(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark full DreamZero.generate (16 steps, CFG)."""
     dtype = resolve_dtype(dtype_str)
@@ -406,6 +463,11 @@ def bench_full_inference(
             )
         raise
 
+    # Shard model weights across devices if mesh is provided
+    if mesh is not None:
+        print("  Sharding DreamZero model weights across devices...")
+        model = shard_params(model, mesh)
+
     key = jax.random.PRNGKey(42)
     k1, k2 = jax.random.split(key)
     # Conditioning video (single frame repeated)
@@ -415,6 +477,15 @@ def bench_full_inference(
     num_blocks = LATENT_T // config.num_frames_per_block
     state = jax.random.normal(k2, (batch_size, num_blocks, config.state_dim), dtype=jnp.float32)
     embodiment_id = jnp.zeros((batch_size,), dtype=jnp.int32)
+
+    # Replicate inputs across all devices when sharding
+    if mesh is not None:
+        replicated = NamedSharding(mesh, P())
+        video = jax.device_put(video, replicated)
+        token_ids = jax.device_put(token_ids, replicated)
+        attention_mask = jax.device_put(attention_mask, replicated)
+        state = jax.device_put(state, replicated)
+        embodiment_id = jax.device_put(embodiment_id, replicated)
 
     # Note: generate() traces through the Python for-loop via XLA.
     # Use nnx.jit so model weights are traced as state, not captured as constants.
@@ -427,6 +498,8 @@ def bench_full_inference(
         )
 
     gen_key = jax.random.PRNGKey(99)
+    if mesh is not None:
+        gen_key = jax.device_put(gen_key, NamedSharding(mesh, P()))
     print(f"  Running full inference benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
         run, model, video, token_ids, state, embodiment_id, attention_mask, gen_key,
@@ -505,6 +578,8 @@ def run_with_oom_fallback(
     warmup: int,
     iters: int,
     use_pallas: bool = False,
+    use_scan: bool = False,
+    mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
     fallback_layers = [num_layers, 16, 8]
@@ -519,6 +594,8 @@ def run_with_oom_fallback(
                 warmup=warmup,
                 iters=iters,
                 use_pallas=use_pallas,
+                use_scan=use_scan,
+                mesh=mesh,
             )
             if result.note and "OOM" in result.note:
                 print(f"  OOM at {nl} layers, trying fewer...")
@@ -593,6 +670,14 @@ Components:
         "--use-pallas", action="store_true",
         help="Enable Pallas kernel optimizations (fused AdaLN)",
     )
+    parser.add_argument(
+        "--use-scan", action="store_true",
+        help="Enable jax.lax.scan over transformer layers (reduces memory)",
+    )
+    parser.add_argument(
+        "--shard", action="store_true",
+        help="Enable tensor parallelism: shard model weights across all TPU chips",
+    )
     args = parser.parse_args()
 
     # --- Device info ---
@@ -619,6 +704,17 @@ Components:
     print(f"Estimated DiT weight memory: ~{weight_gb:.1f} GB ({args.dtype})")
     if args.use_pallas:
         print("Pallas optimizations: ENABLED (fused AdaLN)")
+    if args.use_scan:
+        print("Layer scanning: ENABLED (jax.lax.scan over layers)")
+
+    # --- Tensor parallelism mesh ---
+    mesh = None
+    if args.shard:
+        mesh = create_mesh(mesh_shape=(1, len(devices)))
+        print(f"Tensor parallelism: ENABLED (mesh shape (1, {len(devices)}), "
+              f"{weight_gb / len(devices):.1f} GB/chip estimated)")
+    else:
+        print("Tensor parallelism: DISABLED (single chip)")
 
     # --- Select components ---
     if args.component == "all":
@@ -641,6 +737,8 @@ Components:
                 warmup=args.warmup,
                 iters=args.iters,
                 use_pallas=args.use_pallas,
+                use_scan=args.use_scan,
+                mesh=mesh,
             )
         else:
             print(f"\n[{name}]")
@@ -651,6 +749,7 @@ Components:
                 warmup=args.warmup,
                 iters=args.iters,
                 use_pallas=args.use_pallas,
+                mesh=mesh,
             )
 
         results.append(result)

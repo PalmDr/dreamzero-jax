@@ -424,12 +424,16 @@ def _scan_blocks(
     # Stack states: each leaf becomes (num_layers, ...).
     stacked_state = jax.tree.map(lambda *leaves: jnp.stack(leaves), *all_states)
 
+    input_dtype = x.dtype
+
     def _body(carry, layer_state):
         x_carry = carry
         # Reconstruct a temporary block from the graphdef + this layer's state.
         block = nnx.merge(graphdef, layer_state)
         x_carry = block(x_carry, e, ctx, freqs_cis, mask=mask)
-        return x_carry, None
+        # Cast back to input dtype — RoPE promotes bf16→f32 via complex64,
+        # but scan requires carry input/output dtypes to match.
+        return x_carry.astype(input_dtype), None
 
     x_out, _ = jax.lax.scan(_body, x, stacked_state)
     return x_out
