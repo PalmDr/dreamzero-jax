@@ -186,19 +186,22 @@ def bench_single_block(
     dtype_str: str = "bf16",
     warmup: int = 3,
     iters: int = 10,
+    use_pallas: bool = False,
 ) -> BenchmarkResult:
     """Benchmark a single WanDiTBlock at 14B config."""
     dtype = resolve_dtype(dtype_str)
     dim = CONFIG_14B["dim"]
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
 
-    print(f"  Initializing single WanDiTBlock (d={dim}, heads=40, ffn=13824)...")
+    pallas_str = " [Pallas]" if use_pallas else ""
+    print(f"  Initializing single WanDiTBlock (d={dim}, heads=40, ffn=13824){pallas_str}...")
     block = WanDiTBlock(
         dim=dim,
         num_heads=CONFIG_14B["num_heads"],
         ffn_dim=CONFIG_14B["ffn_dim"],
         has_image_input=True,
         qk_norm=True,
+        use_pallas=use_pallas,
         dtype=dtype,
         param_dtype=dtype,
         rngs=rngs,
@@ -234,13 +237,15 @@ def bench_full_dit(
     dtype_str: str = "bf16",
     warmup: int = 3,
     iters: int = 10,
+    use_pallas: bool = False,
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
     dtype = resolve_dtype(dtype_str)
     dim = CONFIG_14B["dim"]
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
 
-    print(f"  Initializing WanDiT ({num_layers} layers, d={dim})...")
+    pallas_str = " [Pallas]" if use_pallas else ""
+    print(f"  Initializing WanDiT ({num_layers} layers, d={dim}){pallas_str}...")
     try:
         model = WanDiT(
             dim=dim,
@@ -254,6 +259,7 @@ def bench_full_dit(
             patch_size=CONFIG_14B["patch_size"],
             has_image_input=True,
             qk_norm=True,
+            use_pallas=use_pallas,
             dtype=dtype,
             param_dtype=dtype,
             rngs=rngs,
@@ -293,6 +299,7 @@ def bench_vae_encode(
     dtype_str: str = "bf16",
     warmup: int = 3,
     iters: int = 10,
+    use_pallas: bool = False,  # unused, kept for API consistency
 ) -> BenchmarkResult:
     """Benchmark VAE encode: 33 frames @ 320x176."""
     dtype = resolve_dtype(dtype_str)
@@ -328,6 +335,7 @@ def bench_vae_decode(
     dtype_str: str = "bf16",
     warmup: int = 3,
     iters: int = 10,
+    use_pallas: bool = False,  # unused, kept for API consistency
 ) -> BenchmarkResult:
     """Benchmark VAE decode: latents -> 33 frames."""
     dtype = resolve_dtype(dtype_str)
@@ -365,6 +373,7 @@ def bench_full_inference(
     dtype_str: str = "bf16",
     warmup: int = 3,
     iters: int = 10,
+    use_pallas: bool = False,
 ) -> BenchmarkResult:
     """Benchmark full DreamZero.generate (16 steps, CFG)."""
     dtype = resolve_dtype(dtype_str)
@@ -495,6 +504,7 @@ def run_with_oom_fallback(
     dtype_str: str,
     warmup: int,
     iters: int,
+    use_pallas: bool = False,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
     fallback_layers = [num_layers, 16, 8]
@@ -508,6 +518,7 @@ def run_with_oom_fallback(
                 dtype_str=dtype_str,
                 warmup=warmup,
                 iters=iters,
+                use_pallas=use_pallas,
             )
             if result.note and "OOM" in result.note:
                 print(f"  OOM at {nl} layers, trying fewer...")
@@ -578,6 +589,10 @@ Components:
         "--save", type=str, default=None,
         help="Path to save JSON results",
     )
+    parser.add_argument(
+        "--use-pallas", action="store_true",
+        help="Enable Pallas kernel optimizations (fused AdaLN)",
+    )
     args = parser.parse_args()
 
     # --- Device info ---
@@ -602,6 +617,8 @@ Components:
     bytes_per_param = 2 if args.dtype == "bf16" else 4
     weight_gb = total_params * bytes_per_param / (1024 ** 3)
     print(f"Estimated DiT weight memory: ~{weight_gb:.1f} GB ({args.dtype})")
+    if args.use_pallas:
+        print("Pallas optimizations: ENABLED (fused AdaLN)")
 
     # --- Select components ---
     if args.component == "all":
@@ -623,6 +640,7 @@ Components:
                 dtype_str=args.dtype,
                 warmup=args.warmup,
                 iters=args.iters,
+                use_pallas=args.use_pallas,
             )
         else:
             print(f"\n[{name}]")
@@ -632,6 +650,7 @@ Components:
                 dtype_str=args.dtype,
                 warmup=args.warmup,
                 iters=args.iters,
+                use_pallas=args.use_pallas,
             )
 
         results.append(result)
