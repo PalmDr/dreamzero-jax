@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import math
 
 import jax
@@ -16,6 +17,8 @@ from dreamzero_jax.nn.embed import (
     sinusoidal_embedding,
 )
 from dreamzero_jax.nn.mlp import MLP
+
+logger = logging.getLogger(__name__)
 
 # Match PyTorch's GELU(approximate='tanh')
 _gelu_approx = functools.partial(jax.nn.gelu, approximate=True)
@@ -387,6 +390,52 @@ class WanDiTHead(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
+# Scan helper — iterate over transformer layers with jax.lax.scan
+# ---------------------------------------------------------------------------
+
+
+def _scan_blocks(
+    blocks: list,
+    x: jax.Array,
+    e: jax.Array,
+    ctx: jax.Array,
+    freqs_cis: jax.Array,
+    mask: jax.Array | None = None,
+) -> jax.Array:
+    """Run transformer blocks via ``jax.lax.scan`` over stacked parameters.
+
+    Instead of unrolling N identical ``WanDiTBlock`` calls (which causes XLA
+    to materialise all intermediate activations simultaneously), we:
+
+    1. Split every block into ``(graphdef, state)`` using ``nnx.split``.
+    2. Stack all per-layer states into a single pytree with a leading
+       *layer* dimension.
+    3. Use ``jax.lax.scan`` so XLA compiles **one** block body and iterates,
+       reusing activation memory across layers.
+
+    This dramatically reduces peak HBM for inference (no backward pass needed).
+    """
+    # --- Split all blocks into graphdef + state ---
+    # All blocks share the same graphdef (identical structure).
+    splits = [nnx.split(block) for block in blocks]
+    graphdef = splits[0][0]
+    all_states = [s for _, s in splits]
+
+    # Stack states: each leaf becomes (num_layers, ...).
+    stacked_state = jax.tree.map(lambda *leaves: jnp.stack(leaves), *all_states)
+
+    def _body(carry, layer_state):
+        x_carry = carry
+        # Reconstruct a temporary block from the graphdef + this layer's state.
+        block = nnx.merge(graphdef, layer_state)
+        x_carry = block(x_carry, e, ctx, freqs_cis, mask=mask)
+        return x_carry, None
+
+    x_out, _ = jax.lax.scan(_body, x, stacked_state)
+    return x_out
+
+
+# ---------------------------------------------------------------------------
 # WanDiT — full model
 # ---------------------------------------------------------------------------
 
@@ -415,6 +464,7 @@ class WanDiT(nnx.Module):
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
         use_pallas: bool = False,
+        use_scan: bool = False,
         chunk_size: int | None = None,
         *,
         dtype: jnp.dtype = jnp.float32,
@@ -425,7 +475,13 @@ class WanDiT(nnx.Module):
         self.out_channels = out_channels
         self.patch_size = patch_size
         self.has_image_input = has_image_input
+        self.use_scan = use_scan
         head_dim = dim // num_heads
+        if use_scan:
+            logger.info(
+                "WanDiT: use_scan=True — transformer blocks will execute via "
+                "jax.lax.scan (reduces XLA graph size and peak activation memory)."
+            )
 
         # Patch embedding (3D conv)
         self.patch_embedding = PatchEmbed3D(
@@ -535,8 +591,13 @@ class WanDiT(nnx.Module):
         freqs_cis = self.rope(f, h, w)  # (S, head_dim // 2)
 
         # --- Transformer blocks ---
-        for block in self.blocks:
-            x_flat = block(x_flat, e, ctx, freqs_cis)
+        if self.use_scan:
+            x_flat = _scan_blocks(
+                list(self.blocks), x_flat, e, ctx, freqs_cis,
+            )
+        else:
+            for block in self.blocks:
+                x_flat = block(x_flat, e, ctx, freqs_cis)
 
         # --- Output head ---
         x_out = self.head(x_flat, t)  # (B, S, patch_vol * out_channels)

@@ -25,6 +25,7 @@ from dreamzero_jax.models.dit import (
     MLPProj,
     WanDiTBlock,
     WanDiTHead,
+    _scan_blocks,
     unpatchify,
 )
 
@@ -289,6 +290,7 @@ class CausalWanDiT(nnx.Module):
         qk_norm: bool = True,
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
+        use_scan: bool = False,
         # Action-specific
         action_dim: int = 7,
         state_dim: int = 14,
@@ -306,6 +308,7 @@ class CausalWanDiT(nnx.Module):
         self.out_channels = out_channels
         self.patch_size = patch_size
         self.has_image_input = has_image_input
+        self.use_scan = use_scan
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.num_frames_per_block = num_frames_per_block
@@ -511,8 +514,13 @@ class CausalWanDiT(nnx.Module):
             ctx = jnp.concatenate([img_ctx, ctx], axis=1)
 
         # --- Transformer blocks ---
-        for block in self.blocks:
-            full_seq = block(full_seq, e, ctx, freqs_cis, mask=mask)
+        if self.use_scan:
+            full_seq = _scan_blocks(
+                list(self.blocks), full_seq, e, ctx, freqs_cis, mask=mask,
+            )
+        else:
+            for block in self.blocks:
+                full_seq = block(full_seq, e, ctx, freqs_cis, mask=mask)
 
         # --- Extract video and action predictions ---
         clean_len = f * h * w if has_clean else 0

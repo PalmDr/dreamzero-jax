@@ -51,6 +51,7 @@ class DreamZeroConfig:
     patch_size: tuple[int, int, int] = (1, 2, 2)
     qk_norm: bool = True
     cross_attn_norm: bool = False
+    use_scan: bool = False
 
     # Text encoder
     text_vocab: int = 256384
@@ -186,6 +187,7 @@ class DreamZero(nnx.Module):
             has_image_input=config.has_image_input,
             qk_norm=config.qk_norm,
             cross_attn_norm=config.cross_attn_norm,
+            use_scan=config.use_scan,
             action_dim=config.action_dim,
             state_dim=config.state_dim,
             action_hidden_size=config.action_hidden_size,
