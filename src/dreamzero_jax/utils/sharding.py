@@ -282,7 +282,7 @@ def _flatten_state_paths(state: nnx.State) -> dict[str, jax.Array]:
     """
     flat: dict[str, jax.Array] = {}
     raw = state.flat_state()
-    for key_tuple, value in raw.items():
+    for key_tuple, value in raw:
         path = ".".join(str(k) for k in key_tuple)
         if hasattr(value, "value"):
             flat[path] = value.value
@@ -341,8 +341,8 @@ def shard_params(
     graphdef, state = nnx.split(model)
     flat = state.flat_state()
 
-    sharded_flat: dict[tuple, Any] = {}
-    for key_tuple, value in flat.items():
+    sharded_items: list[tuple[tuple, Any]] = []
+    for key_tuple, value in flat:
         path = ".".join(str(k) for k in key_tuple)
         if hasattr(value, "value"):
             arr = value.value
@@ -357,10 +357,14 @@ def shard_params(
             value = value.replace(sharded_arr)
         else:
             value = sharded_arr
-        sharded_flat[key_tuple] = value
+        sharded_items.append((key_tuple, value))
 
-    state = nnx.State(sharded_flat)
-    model = nnx.merge(graphdef, state)
+    # Reconstruct nested state from flat items, then merge back
+    sharded_state = flat.from_sorted_keys_values(
+        [k for k, _ in sharded_items],
+        [v for _, v in sharded_items],
+    ).to_nested_state()
+    model = nnx.merge(graphdef, sharded_state)
     return model
 
 
