@@ -216,13 +216,13 @@ def bench_single_block(
     head_dim = dim // CONFIG_14B["num_heads"]
     freqs_cis = jnp.ones((SEQ_LEN, head_dim // 2), dtype=jnp.complex64)
 
-    @jax.jit
-    def run(x, e, context, freqs_cis):
-        return block(x, e, context, freqs_cis)
+    @nnx.jit
+    def run(model, x, e, context, freqs_cis):
+        return model(x, e, context, freqs_cis)
 
     print(f"  Running benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
-        run, x, e, context, freqs_cis,
+        run, block, x, e, context, freqs_cis,
         warmup=warmup, iters=iters,
         name=f"Single DiT block (d={dim})",
     )
@@ -275,13 +275,13 @@ def bench_full_dit(
     context = jax.random.normal(k2, (batch_size, TEXT_SEQ_LEN, CONFIG_14B["text_dim"]), dtype=dtype)
     clip_emb = jax.random.normal(k3, (batch_size, 257, 1280), dtype=dtype)
 
-    @jax.jit
-    def run(x, timestep, context, clip_emb):
+    @nnx.jit
+    def run(model, x, timestep, context, clip_emb):
         return model(x, timestep, context, clip_emb=clip_emb)
 
     print(f"  Running benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
-        run, x, timestep, context, clip_emb,
+        run, model, x, timestep, context, clip_emb,
         warmup=warmup, iters=iters,
         name=f"Full DiT ({num_layers} layers)",
     )
@@ -310,13 +310,13 @@ def bench_vae_encode(
     key = jax.random.PRNGKey(42)
     video = jax.random.normal(key, (batch_size, VIDEO_FRAMES, VIDEO_H, VIDEO_W, 3), dtype=dtype)
 
-    @jax.jit
-    def run(video):
-        return vae.encode(video)
+    @nnx.jit
+    def run(model, video):
+        return model.encode(video)
 
     print(f"  Running VAE encode benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
-        run, video,
+        run, vae, video,
         warmup=warmup, iters=iters,
         name=f"VAE encode ({VIDEO_FRAMES}f @ {VIDEO_H}x{VIDEO_W})",
     )
@@ -347,13 +347,13 @@ def bench_vae_decode(
         key, (batch_size, LATENT_T, LATENT_H, LATENT_W, LATENT_C), dtype=dtype,
     )
 
-    @jax.jit
-    def run(latents):
-        return vae.decode(latents)
+    @nnx.jit
+    def run(model, latents):
+        return model.decode(latents)
 
     print(f"  Running VAE decode benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
-        run, latents,
+        run, vae, latents,
         warmup=warmup, iters=iters,
         name=f"VAE decode -> {VIDEO_FRAMES}f @ {VIDEO_H}x{VIDEO_W}",
     )
@@ -407,11 +407,10 @@ def bench_full_inference(
     state = jax.random.normal(k2, (batch_size, num_blocks, config.state_dim), dtype=jnp.float32)
     embodiment_id = jnp.zeros((batch_size,), dtype=jnp.int32)
 
-    # Note: generate() is NOT trivially jittable because of the Python for-loop
-    # over scheduler timesteps. We wrap it in jax.jit anyway; XLA will trace
-    # through the unrolled loop.
-    @jax.jit
-    def run(video, token_ids, state, embodiment_id, attention_mask, key):
+    # Note: generate() traces through the Python for-loop via XLA.
+    # Use nnx.jit so model weights are traced as state, not captured as constants.
+    @nnx.jit
+    def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
         return model.generate(
             video, token_ids, state, embodiment_id,
             attention_mask=attention_mask,
@@ -421,7 +420,7 @@ def bench_full_inference(
     gen_key = jax.random.PRNGKey(99)
     print(f"  Running full inference benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
-        run, video, token_ids, state, embodiment_id, attention_mask, gen_key,
+        run, model, video, token_ids, state, embodiment_id, attention_mask, gen_key,
         warmup=warmup, iters=iters,
         name=f"Full inference ({num_layers}L, 16 steps, CFG)",
     )
