@@ -678,12 +678,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     # --- Prepare dummy state and embodiment ID ---
     # State: (B, num_blocks, state_dim) - zeros as placeholder
     # Number of blocks is determined by temporal latent frames / num_frames_per_block
-    # For a rough estimate, we compute from video shape:
-    #   T_latent = T_input / 4 (VAE temporal compression)
-    #   num_blocks = T_latent / num_frames_per_block
+    # The VAE applies 2 temporal downsamples, each a CausalConv3d with stride=2:
+    #   T -> floor((T - 1) / 2) + 1  (per downsample)
+    # This is equivalent to ceil(T / 4) for two 2x downsamples.
     T_input = video_batch.shape[1]
-    # VAE does 4x temporal compression (with 2 temporal downsamples each 2x)
-    T_latent = max(1, T_input // 4)
+    # VAE does 4x temporal compression (2 causal stride-2 downsamples)
+    T_latent = (T_input - 1) // 2 + 1   # first temporal downsample
+    T_latent = (T_latent - 1) // 2 + 1  # second temporal downsample
     num_blocks = max(1, T_latent // config.num_frames_per_block)
     state = np.zeros((1, num_blocks, config.state_dim), dtype=np.float32)
     logger.info("State shape: %s (num_blocks=%d)", state.shape, num_blocks)

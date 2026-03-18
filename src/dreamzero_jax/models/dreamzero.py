@@ -383,6 +383,51 @@ class DreamZero(nnx.Module):
     # Inference
     # -----------------------------------------------------------------
 
+    def _compute_num_blocks(self, latents: jax.Array) -> int:
+        """Compute the number of temporal blocks from encoded latents.
+
+        The patch embedding uses ``patch_size[0]`` as temporal stride, so
+        ``f = T_latent // patch_size[0]`` and
+        ``num_blocks = f // num_frames_per_block``.
+
+        Args:
+            latents: Encoded video latents ``(B, T_lat, H_lat, W_lat, C)``.
+
+        Returns:
+            Number of temporal blocks.
+        """
+        T_lat = latents.shape[1]
+        f = T_lat // self.config.patch_size[0]
+        return f // self.config.num_frames_per_block
+
+    def _validate_state(
+        self, state: jax.Array, num_blocks: int
+    ) -> jax.Array:
+        """Validate and fix the state tensor's temporal dimension.
+
+        If the caller provides a state with fewer blocks than the model
+        expects (common when ``T_latent`` is computed with ``T // 4``
+        instead of the exact VAE causal compression formula), pad with
+        zeros so the downstream interleave loop produces the correct
+        sequence length.
+
+        Args:
+            state: ``(B, num_blocks_in, state_dim)``.
+            num_blocks: Expected number of blocks.
+
+        Returns:
+            ``(B, num_blocks, state_dim)`` — padded or truncated as needed.
+        """
+        actual = state.shape[1]
+        if actual == num_blocks:
+            return state
+        if actual < num_blocks:
+            # Pad with zeros
+            pad_width = ((0, 0), (0, num_blocks - actual), (0, 0))
+            return jnp.pad(state, pad_width)
+        # Truncate
+        return state[:, :num_blocks]
+
     def generate(
         self,
         video: jax.Array,
@@ -425,6 +470,10 @@ class DreamZero(nnx.Module):
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0])
 
+        # --- Validate state against actual latent temporal dim ---
+        num_blocks = self._compute_num_blocks(latents)
+        state = self._validate_state(state, num_blocks)
+
         # Null prompt for unconditional branch (zeros)
         null_prompt = jnp.zeros_like(prompt_emb)
 
@@ -434,8 +483,7 @@ class DreamZero(nnx.Module):
         noisy_video = jax.random.normal(key_vid, latents.shape)
 
         total_actions = (
-            latents.shape[1]
-            // self.config.num_frames_per_block
+            num_blocks
             * (self.config.action_horizon or self.config.num_action_per_block)
         )
         noisy_actions = jax.random.normal(
@@ -538,6 +586,10 @@ class DreamZero(nnx.Module):
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0]) if self.config.has_image_input else None
 
+        # --- Validate state against actual latent temporal dim ---
+        num_blocks = self._compute_num_blocks(latents)
+        state = self._validate_state(state, num_blocks)
+
         # Null prompt for unconditional branch (zeros)
         null_prompt = jnp.zeros_like(prompt_emb)
 
@@ -546,8 +598,7 @@ class DreamZero(nnx.Module):
         noisy_video = jax.random.normal(key_vid, latents.shape)
 
         total_actions = (
-            latents.shape[1]
-            // self.config.num_frames_per_block
+            num_blocks
             * (self.config.action_horizon or self.config.num_action_per_block)
         )
         noisy_actions = jax.random.normal(
