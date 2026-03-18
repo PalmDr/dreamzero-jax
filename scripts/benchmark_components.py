@@ -259,6 +259,7 @@ def bench_full_dit(
     use_scan: bool = False,
     use_remat: bool = False,
     mesh: Mesh | None = None,
+    scan_loop: bool = False,  # unused, kept for API consistency with run_with_oom_fallback
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
     dtype = resolve_dtype(dtype_str)
@@ -443,8 +444,13 @@ def bench_full_inference(
     use_scan: bool = False,
     use_remat: bool = False,
     mesh: Mesh | None = None,
+    scan_loop: bool = False,
 ) -> BenchmarkResult:
-    """Benchmark full DreamZero.generate (16 steps, CFG)."""
+    """Benchmark full DreamZero.generate (16 steps, CFG).
+
+    If scan_loop=True, uses generate_scan() (Euler + jax.lax.scan) instead
+    of generate() (UniPC + Python for-loop), eliminating dispatch overhead.
+    """
     dtype = resolve_dtype(dtype_str)
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
 
@@ -506,24 +512,35 @@ def bench_full_inference(
         state = jax.device_put(state, replicated)
         embodiment_id = jax.device_put(embodiment_id, replicated)
 
-    # Note: generate() traces through the Python for-loop via XLA.
     # Use nnx.jit so model weights are traced as state, not captured as constants.
-    @nnx.jit
-    def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
-        return model.generate(
-            video, token_ids, state, embodiment_id,
-            attention_mask=attention_mask,
-            key=key,
-        )
+    if scan_loop:
+        # generate_scan(): Euler scheduler + jax.lax.scan (single XLA dispatch)
+        @nnx.jit
+        def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
+            return model.generate_scan(
+                video, token_ids, state, embodiment_id,
+                attention_mask=attention_mask,
+                key=key,
+            )
+    else:
+        # generate(): UniPC scheduler + Python for-loop (N dispatches)
+        @nnx.jit
+        def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
+            return model.generate(
+                video, token_ids, state, embodiment_id,
+                attention_mask=attention_mask,
+                key=key,
+            )
 
+    loop_str = "scan" if scan_loop else "PyLoop"
     gen_key = jax.random.PRNGKey(99)
     if mesh is not None:
         gen_key = jax.device_put(gen_key, NamedSharding(mesh, P()))
-    print(f"  Running full inference benchmark ({warmup} warmup + {iters} timed)...")
+    print(f"  Running full inference benchmark [{loop_str}] ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
         run, model, video, token_ids, state, embodiment_id, attention_mask, gen_key,
         warmup=warmup, iters=iters,
-        name=f"Full inference ({num_layers}L, 16 steps, CFG)",
+        name=f"Full inference ({num_layers}L, 16 steps, {loop_str})",
     )
 
 
@@ -600,6 +617,7 @@ def run_with_oom_fallback(
     use_scan: bool = False,
     use_remat: bool = False,
     mesh: Mesh | None = None,
+    scan_loop: bool = False,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
     fallback_layers = [num_layers, 16, 8]
@@ -617,6 +635,7 @@ def run_with_oom_fallback(
                 use_scan=use_scan,
                 use_remat=use_remat,
                 mesh=mesh,
+                scan_loop=scan_loop,
             )
             if result.note and "OOM" in result.note:
                 print(f"  OOM at {nl} layers, trying fewer...")
@@ -701,6 +720,11 @@ Components:
              "to reduce peak activation memory. Trades compute for memory.",
     )
     parser.add_argument(
+        "--scan-loop", action="store_true",
+        help="Use generate_scan() (Euler + jax.lax.scan) instead of generate() "
+             "(UniPC + Python for-loop) for full_inference. Eliminates dispatch overhead.",
+    )
+    parser.add_argument(
         "--shard", action="store_true",
         help="Enable tensor parallelism: shard model weights across all TPU chips",
     )
@@ -734,6 +758,8 @@ Components:
         print("Layer scanning: ENABLED (jax.lax.scan over layers)")
     if args.use_remat:
         print("Activation checkpointing: ENABLED (jax.checkpoint/remat per DiT block)")
+    if args.scan_loop:
+        print("Scan denoising loop: ENABLED (generate_scan with Euler + jax.lax.scan)")
 
     # --- Tensor parallelism mesh ---
     mesh = None
@@ -768,6 +794,7 @@ Components:
                 use_scan=args.use_scan,
                 use_remat=args.use_remat,
                 mesh=mesh,
+                scan_loop=args.scan_loop if name == "full_inference" else False,
             )
         else:
             print(f"\n[{name}]")
