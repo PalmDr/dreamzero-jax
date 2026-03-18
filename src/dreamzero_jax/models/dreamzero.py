@@ -8,7 +8,7 @@ This corresponds to ``WANPolicyHead`` in the PyTorch reference.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import jax
@@ -52,6 +52,7 @@ class DreamZeroConfig:
     qk_norm: bool = True
     cross_attn_norm: bool = False
     use_scan: bool = False
+    use_remat: bool = False
 
     # Text encoder
     text_vocab: int = 256384
@@ -93,6 +94,10 @@ class DreamZeroConfig:
 
     # Image-to-video
     has_image_input: bool = True
+
+    # Precision — bf16 halves weight memory (critical for TPU HBM budgets)
+    dtype: jnp.dtype = field(default_factory=lambda: jnp.float32)
+    param_dtype: jnp.dtype = field(default_factory=lambda: jnp.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +149,9 @@ class DreamZero(nnx.Module):
         self.config = config
 
         # --- Sub-models ---
+        dtype = config.dtype
+        param_dtype = config.param_dtype
+
         self.text_encoder = WanTextEncoder(
             vocab=config.text_vocab,
             dim=config.text_dim,
@@ -153,6 +161,8 @@ class DreamZero(nnx.Module):
             num_layers=config.text_num_layers,
             num_buckets=config.text_num_buckets,
             shared_pos=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
         )
 
@@ -165,12 +175,16 @@ class DreamZero(nnx.Module):
             num_heads=config.image_num_heads,
             num_layers=config.image_num_layers,
             activation="gelu",
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
         )
 
         self.vae = WanVideoVAE(
             z_dim=config.vae_z_dim,
             base_dim=config.vae_base_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
         )
 
@@ -188,6 +202,7 @@ class DreamZero(nnx.Module):
             qk_norm=config.qk_norm,
             cross_attn_norm=config.cross_attn_norm,
             use_scan=config.use_scan,
+            use_remat=config.use_remat,
             action_dim=config.action_dim,
             state_dim=config.state_dim,
             action_hidden_size=config.action_hidden_size,
@@ -195,6 +210,8 @@ class DreamZero(nnx.Module):
             num_state_per_block=config.num_state_per_block,
             num_frames_per_block=config.num_frames_per_block,
             max_num_embodiments=config.max_num_embodiments,
+            dtype=dtype,
+            param_dtype=param_dtype,
             rngs=rngs,
         )
 

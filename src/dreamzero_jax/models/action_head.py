@@ -25,6 +25,7 @@ from dreamzero_jax.models.dit import (
     MLPProj,
     WanDiTBlock,
     WanDiTHead,
+    _remat_blocks,
     _scan_blocks,
     unpatchify,
 )
@@ -291,6 +292,7 @@ class CausalWanDiT(nnx.Module):
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
         use_scan: bool = False,
+        use_remat: bool = False,
         # Action-specific
         action_dim: int = 7,
         state_dim: int = 14,
@@ -309,6 +311,7 @@ class CausalWanDiT(nnx.Module):
         self.patch_size = patch_size
         self.has_image_input = has_image_input
         self.use_scan = use_scan
+        self.use_remat = use_remat
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.num_frames_per_block = num_frames_per_block
@@ -516,6 +519,11 @@ class CausalWanDiT(nnx.Module):
         # --- Transformer blocks ---
         if self.use_scan:
             full_seq = _scan_blocks(
+                list(self.blocks), full_seq, e, ctx, freqs_cis, mask=mask,
+                use_remat=self.use_remat,
+            )
+        elif self.use_remat:
+            full_seq = _remat_blocks(
                 list(self.blocks), full_seq, e, ctx, freqs_cis, mask=mask,
             )
         else:

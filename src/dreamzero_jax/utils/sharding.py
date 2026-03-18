@@ -23,6 +23,7 @@ import re
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -321,6 +322,7 @@ def compute_param_shardings(
 def shard_params(
     model: nnx.Module,
     mesh: Mesh,
+    param_dtype: jnp.dtype | None = None,
 ) -> nnx.Module:
     """Reshard a model's parameters according to the computed partition specs.
 
@@ -348,6 +350,9 @@ def shard_params(
             arr = value.value
         else:
             arr = value
+
+        if param_dtype is not None and arr.dtype != param_dtype:
+            arr = arr.astype(param_dtype)
 
         pspec = get_partition_spec(path, arr.shape, mesh)
         sharding = NamedSharding(mesh, pspec)

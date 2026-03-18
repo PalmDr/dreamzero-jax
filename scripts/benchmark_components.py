@@ -23,6 +23,7 @@ Usage (CPU, smoke-test only):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -256,6 +257,7 @@ def bench_full_dit(
     iters: int = 10,
     use_pallas: bool = False,
     use_scan: bool = False,
+    use_remat: bool = False,
     mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
@@ -266,27 +268,35 @@ def bench_full_dit(
     flags = []
     if use_pallas: flags.append("Pallas")
     if use_scan: flags.append("Scan")
+    if use_remat: flags.append("Remat")
     flag_str = f" [{', '.join(flags)}]" if flags else ""
-    print(f"  Initializing WanDiT ({num_layers} layers, d={dim}){flag_str}...")
+    # Initialise on CPU when sharding is enabled to avoid OOM on TPU chip 0.
+    # The full 14B model weights (~30 GB bf16) exceed single-chip HBM.
+    init_device = jax.devices("cpu")[0] if mesh is not None else None
+    init_ctx = jax.default_device(init_device) if init_device else contextlib.nullcontext()
+    print(f"  Initializing WanDiT ({num_layers} layers, d={dim}){flag_str}"
+          f"{' [CPU init]' if init_device else ''}...")
     try:
-        model = WanDiT(
-            dim=dim,
-            in_channels=CONFIG_14B["in_channels"],
-            out_channels=CONFIG_14B["out_channels"],
-            ffn_dim=CONFIG_14B["ffn_dim"],
-            freq_dim=CONFIG_14B["freq_dim"],
-            text_dim=CONFIG_14B["text_dim"],
-            num_heads=CONFIG_14B["num_heads"],
-            num_layers=num_layers,
-            patch_size=CONFIG_14B["patch_size"],
-            has_image_input=True,
-            qk_norm=True,
-            use_pallas=use_pallas,
-            use_scan=use_scan,
-            dtype=dtype,
-            param_dtype=dtype,
-            rngs=rngs,
-        )
+        with init_ctx:
+            model = WanDiT(
+                dim=dim,
+                in_channels=CONFIG_14B["in_channels"],
+                out_channels=CONFIG_14B["out_channels"],
+                ffn_dim=CONFIG_14B["ffn_dim"],
+                freq_dim=CONFIG_14B["freq_dim"],
+                text_dim=CONFIG_14B["text_dim"],
+                num_heads=CONFIG_14B["num_heads"],
+                num_layers=num_layers,
+                patch_size=CONFIG_14B["patch_size"],
+                has_image_input=True,
+                qk_norm=True,
+                use_pallas=use_pallas,
+                use_scan=use_scan,
+                use_remat=use_remat,
+                dtype=dtype,
+                param_dtype=dtype,
+                rngs=rngs,
+            )
     except Exception as e:
         if "out of memory" in str(e).lower() or "OOM" in str(e):
             return BenchmarkResult(
@@ -430,6 +440,8 @@ def bench_full_inference(
     warmup: int = 3,
     iters: int = 10,
     use_pallas: bool = False,
+    use_scan: bool = False,
+    use_remat: bool = False,
     mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Benchmark full DreamZero.generate (16 steps, CFG)."""
@@ -449,11 +461,19 @@ def bench_full_inference(
         has_image_input=True,
         num_inference_steps=16,
         cfg_scale=5.0,
+        use_scan=use_scan,
+        use_remat=use_remat,
+        dtype=dtype,
+        param_dtype=dtype,
     )
 
-    print(f"  Initializing full DreamZero model ({num_layers} layers)...")
+    init_device = jax.devices("cpu")[0] if mesh is not None else None
+    init_ctx = jax.default_device(init_device) if init_device else contextlib.nullcontext()
+    print(f"  Initializing full DreamZero model ({num_layers} layers)"
+          f"{' [CPU init]' if init_device else ''}...")
     try:
-        model = DreamZero(config, rngs=rngs)
+        with init_ctx:
+            model = DreamZero(config, rngs=rngs)
     except Exception as e:
         if "out of memory" in str(e).lower() or "OOM" in str(e):
             return BenchmarkResult(
@@ -466,11 +486,10 @@ def bench_full_inference(
     # Shard model weights across devices if mesh is provided
     if mesh is not None:
         print("  Sharding DreamZero model weights across devices...")
-        model = shard_params(model, mesh)
+        model = shard_params(model, mesh, param_dtype=dtype)
 
     key = jax.random.PRNGKey(42)
     k1, k2 = jax.random.split(key)
-    # Conditioning video (single frame repeated)
     video = jax.random.normal(k1, (batch_size, VIDEO_FRAMES, VIDEO_H, VIDEO_W, 3), dtype=dtype)
     token_ids = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
     attention_mask = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
@@ -579,6 +598,7 @@ def run_with_oom_fallback(
     iters: int,
     use_pallas: bool = False,
     use_scan: bool = False,
+    use_remat: bool = False,
     mesh: Mesh | None = None,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
@@ -595,6 +615,7 @@ def run_with_oom_fallback(
                 iters=iters,
                 use_pallas=use_pallas,
                 use_scan=use_scan,
+                use_remat=use_remat,
                 mesh=mesh,
             )
             if result.note and "OOM" in result.note:
@@ -675,6 +696,11 @@ Components:
         help="Enable jax.lax.scan over transformer layers (reduces memory)",
     )
     parser.add_argument(
+        "--use-remat", action="store_true",
+        help="Enable activation checkpointing (jax.checkpoint/remat) on each DiT block "
+             "to reduce peak activation memory. Trades compute for memory.",
+    )
+    parser.add_argument(
         "--shard", action="store_true",
         help="Enable tensor parallelism: shard model weights across all TPU chips",
     )
@@ -706,6 +732,8 @@ Components:
         print("Pallas optimizations: ENABLED (fused AdaLN)")
     if args.use_scan:
         print("Layer scanning: ENABLED (jax.lax.scan over layers)")
+    if args.use_remat:
+        print("Activation checkpointing: ENABLED (jax.checkpoint/remat per DiT block)")
 
     # --- Tensor parallelism mesh ---
     mesh = None
@@ -738,6 +766,7 @@ Components:
                 iters=args.iters,
                 use_pallas=args.use_pallas,
                 use_scan=args.use_scan,
+                use_remat=args.use_remat,
                 mesh=mesh,
             )
         else:

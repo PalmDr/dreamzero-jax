@@ -394,6 +394,41 @@ class WanDiTHead(nnx.Module):
 # ---------------------------------------------------------------------------
 
 
+def _remat_blocks(
+    blocks: list,
+    x: jax.Array,
+    e: jax.Array,
+    ctx: jax.Array,
+    freqs_cis: jax.Array,
+    mask: jax.Array | None = None,
+) -> jax.Array:
+    """Run transformer blocks with per-block activation checkpointing.
+
+    Each block is executed via a ``jax.checkpoint``-wrapped pure function
+    using the ``nothing_saveable`` policy.  This tells XLA to discard all
+    intermediate activations produced inside each block and recompute them
+    if they are needed later (e.g. for a backward pass, or to allow XLA to
+    free memory between sequential block executions during inference).
+
+    The functional pattern (split → checkpoint → merge) is needed because
+    Flax NNX modules are stateful objects, while ``jax.checkpoint`` requires
+    a pure function.
+    """
+    for block in blocks:
+        graphdef, state = nnx.split(block)
+
+        @functools.partial(
+            jax.checkpoint,
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
+        def _run(state, x_in):
+            b = nnx.merge(graphdef, state)
+            return b(x_in, e, ctx, freqs_cis, mask=mask)
+
+        x = _run(state, x)
+    return x
+
+
 def _scan_blocks(
     blocks: list,
     x: jax.Array,
@@ -401,6 +436,7 @@ def _scan_blocks(
     ctx: jax.Array,
     freqs_cis: jax.Array,
     mask: jax.Array | None = None,
+    use_remat: bool = False,
 ) -> jax.Array:
     """Run transformer blocks via ``jax.lax.scan`` over stacked parameters.
 
@@ -414,6 +450,12 @@ def _scan_blocks(
        reusing activation memory across layers.
 
     This dramatically reduces peak HBM for inference (no backward pass needed).
+
+    When ``use_remat=True``, each block call is wrapped with
+    ``jax.checkpoint`` using ``nothing_saveable`` policy, which tells XLA
+    to discard all intermediate activations within the block and recompute
+    them if needed.  For forward-only inference this allows XLA to free
+    per-block intermediates sooner, reducing peak HBM.
     """
     # --- Split all blocks into graphdef + state ---
     # All blocks share the same graphdef (identical structure).
@@ -426,11 +468,20 @@ def _scan_blocks(
 
     input_dtype = x.dtype
 
+    def _block_forward(layer_state, x_carry):
+        """Run a single block given its state and input."""
+        block = nnx.merge(graphdef, layer_state)
+        return block(x_carry, e, ctx, freqs_cis, mask=mask)
+
+    if use_remat:
+        _block_forward = jax.checkpoint(
+            _block_forward,
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
+
     def _body(carry, layer_state):
         x_carry = carry
-        # Reconstruct a temporary block from the graphdef + this layer's state.
-        block = nnx.merge(graphdef, layer_state)
-        x_carry = block(x_carry, e, ctx, freqs_cis, mask=mask)
+        x_carry = _block_forward(layer_state, x_carry)
         # Cast back to input dtype — RoPE promotes bf16→f32 via complex64,
         # but scan requires carry input/output dtypes to match.
         return x_carry.astype(input_dtype), None
@@ -469,6 +520,7 @@ class WanDiT(nnx.Module):
         eps: float = 1e-6,
         use_pallas: bool = False,
         use_scan: bool = False,
+        use_remat: bool = False,
         chunk_size: int | None = None,
         *,
         dtype: jnp.dtype = jnp.float32,
@@ -480,7 +532,14 @@ class WanDiT(nnx.Module):
         self.patch_size = patch_size
         self.has_image_input = has_image_input
         self.use_scan = use_scan
+        self.use_remat = use_remat
         head_dim = dim // num_heads
+        if use_remat:
+            logger.info(
+                "WanDiT: use_remat=True — each DiT block will be wrapped with "
+                "jax.checkpoint (nothing_saveable policy) to minimize peak "
+                "activation memory."
+            )
         if use_scan:
             logger.info(
                 "WanDiT: use_scan=True — transformer blocks will execute via "
@@ -597,6 +656,11 @@ class WanDiT(nnx.Module):
         # --- Transformer blocks ---
         if self.use_scan:
             x_flat = _scan_blocks(
+                list(self.blocks), x_flat, e, ctx, freqs_cis,
+                use_remat=self.use_remat,
+            )
+        elif self.use_remat:
+            x_flat = _remat_blocks(
                 list(self.blocks), x_flat, e, ctx, freqs_cis,
             )
         else:
