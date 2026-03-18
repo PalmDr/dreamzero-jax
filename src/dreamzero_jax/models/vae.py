@@ -120,12 +120,12 @@ class ResidualBlock(nnx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
-        self.norm1 = nnx.RMSNorm(in_channels, rngs=rngs)
+        self.norm1 = nnx.RMSNorm(in_channels, param_dtype=param_dtype, rngs=rngs)
         self.conv1 = CausalConv3d(
             in_channels, out_channels, kernel_size=3, padding=1,
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
-        self.norm2 = nnx.RMSNorm(out_channels, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(out_channels, param_dtype=param_dtype, rngs=rngs)
         self.conv2 = CausalConv3d(
             out_channels, out_channels, kernel_size=3, padding=1,
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
@@ -171,7 +171,7 @@ class AttentionBlock(nnx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
-        self.norm = nnx.RMSNorm(dim, rngs=rngs)
+        self.norm = nnx.RMSNorm(dim, param_dtype=param_dtype, rngs=rngs)
         self.attn = Attention(
             dim=dim,
             num_heads=1,
@@ -420,7 +420,7 @@ class Encoder3d(nnx.Module):
         self.mid_block2 = ResidualBlock(last_dim, last_dim, **kw)
 
         # Head
-        self.head_norm = nnx.RMSNorm(last_dim, rngs=rngs)
+        self.head_norm = nnx.RMSNorm(last_dim, param_dtype=param_dtype, rngs=rngs)
         self.head_conv = CausalConv3d(last_dim, 2 * z_dim, kernel_size=3, padding=1, **kw)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -519,7 +519,7 @@ class Decoder3d(nnx.Module):
 
         # Head
         last_dim = rev_dims[-1]
-        self.head_norm = nnx.RMSNorm(last_dim, rngs=rngs)
+        self.head_norm = nnx.RMSNorm(last_dim, param_dtype=param_dtype, rngs=rngs)
         self.head_conv = CausalConv3d(last_dim, 3, kernel_size=3, padding=1, **kw)
 
     def __call__(self, z: jax.Array) -> jax.Array:

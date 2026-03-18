@@ -71,11 +71,13 @@ class FlowUniPCMultistepScheduler:
             assert shift is not None
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
+        # Extract min/max as Python floats from numpy BEFORE converting to jnp
+        # (jnp scalars cannot be converted via float() under jax.jit tracing).
+        self.sigma_min = float(sigmas[-1])
+        self.sigma_max = float(sigmas[0])
+
         self.sigmas: jax.Array = jnp.array(sigmas, dtype=jnp.float32)
         self.timesteps: jax.Array = self.sigmas * num_train_timesteps
-
-        self.sigma_min = float(self.sigmas[-1])
-        self.sigma_max = float(self.sigmas[0])
 
         # Mutable state for multi-step solver
         self.num_inference_steps: int | None = None

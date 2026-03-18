@@ -35,6 +35,7 @@ class T5RelativeEmbedding(nnx.Module):
         bidirectional: bool = True,
         max_dist: int = 128,
         *,
+        param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.num_buckets = num_buckets
@@ -44,12 +45,13 @@ class T5RelativeEmbedding(nnx.Module):
 
         std = (2 * num_buckets * num_heads) ** -0.5
         self.embedding = nnx.Embed(
-            num_embeddings=num_buckets, features=num_heads, rngs=rngs,
+            num_embeddings=num_buckets, features=num_heads,
+            param_dtype=param_dtype, rngs=rngs,
         )
         # Re-init with the T5-specific std
         self.embedding.embedding[...] = (
             jax.random.normal(rngs.params(), (num_buckets, num_heads)) * std
-        )
+        ).astype(param_dtype)
 
     def _relative_position_bucket(self, rel_pos: jax.Array) -> jax.Array:
         """Map relative positions to bucket indices."""
@@ -223,16 +225,17 @@ class T5SelfAttention(nnx.Module):
     ):
         self.shared_pos = shared_pos
 
-        self.norm1 = nnx.RMSNorm(dim, rngs=rngs)
+        self.norm1 = nnx.RMSNorm(dim, param_dtype=param_dtype, rngs=rngs)
         self.attn = T5Attention(
             dim, dim_attn, num_heads, dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
-        self.norm2 = nnx.RMSNorm(dim, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(dim, param_dtype=param_dtype, rngs=rngs)
         self.ffn = T5FeedForward(dim, dim_ffn, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
         if not shared_pos:
             self.pos_embedding = T5RelativeEmbedding(
-                num_buckets, num_heads, bidirectional=True, rngs=rngs,
+                num_buckets, num_heads, bidirectional=True,
+                param_dtype=param_dtype, rngs=rngs,
             )
 
     def __call__(
@@ -281,12 +284,14 @@ class WanTextEncoder(nnx.Module):
         self.num_layers = num_layers
 
         self.token_embedding = nnx.Embed(
-            num_embeddings=vocab, features=dim, rngs=rngs,
+            num_embeddings=vocab, features=dim,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.shared_pos = shared_pos
         if shared_pos:
             self.pos_embedding = T5RelativeEmbedding(
-                num_buckets, num_heads, bidirectional=True, rngs=rngs,
+                num_buckets, num_heads, bidirectional=True,
+                param_dtype=param_dtype, rngs=rngs,
             )
         else:
             self.pos_embedding = None
@@ -299,7 +304,7 @@ class WanTextEncoder(nnx.Module):
             for _ in range(num_layers)
         ])
 
-        self.norm = nnx.RMSNorm(dim, rngs=rngs)
+        self.norm = nnx.RMSNorm(dim, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(
         self,

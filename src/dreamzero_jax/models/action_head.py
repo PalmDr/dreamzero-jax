@@ -51,12 +51,13 @@ class CategorySpecificLinear(nnx.Module):
         input_dim: int,
         output_dim: int,
         *,
+        param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.weight = nnx.Param(
-            jax.random.normal(rngs.params(), (num_categories, input_dim, output_dim)) * 0.02
+            (jax.random.normal(rngs.params(), (num_categories, input_dim, output_dim)) * 0.02).astype(param_dtype)
         )
-        self.bias = nnx.Param(jnp.zeros((num_categories, output_dim)))
+        self.bias = nnx.Param(jnp.zeros((num_categories, output_dim), dtype=param_dtype))
 
     def __call__(self, x: jax.Array, category_ids: jax.Array) -> jax.Array:
         """
@@ -84,13 +85,16 @@ class CategorySpecificMLP(nnx.Module):
         hidden_dim: int,
         output_dim: int,
         *,
+        param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.linear1 = CategorySpecificLinear(
-            num_categories, input_dim, hidden_dim, rngs=rngs,
+            num_categories, input_dim, hidden_dim,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.linear2 = CategorySpecificLinear(
-            num_categories, hidden_dim, output_dim, rngs=rngs,
+            num_categories, hidden_dim, output_dim,
+            param_dtype=param_dtype, rngs=rngs,
         )
 
     def __call__(self, x: jax.Array, category_ids: jax.Array) -> jax.Array:
@@ -114,17 +118,21 @@ class MultiEmbodimentActionEncoder(nnx.Module):
         hidden_size: int,
         num_embodiments: int = 32,
         *,
+        param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         self.hidden_size = hidden_size
         self.W1 = CategorySpecificLinear(
-            num_embodiments, action_dim, hidden_size, rngs=rngs,
+            num_embodiments, action_dim, hidden_size,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.W2 = CategorySpecificLinear(
-            num_embodiments, 2 * hidden_size, hidden_size, rngs=rngs,
+            num_embodiments, 2 * hidden_size, hidden_size,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.W3 = CategorySpecificLinear(
-            num_embodiments, hidden_size, hidden_size, rngs=rngs,
+            num_embodiments, hidden_size, hidden_size,
+            param_dtype=param_dtype, rngs=rngs,
         )
 
     def __call__(
@@ -359,13 +367,16 @@ class CausalWanDiT(nnx.Module):
 
         # --- Action-specific ---
         self.state_encoder = CategorySpecificMLP(
-            max_num_embodiments, state_dim, action_hidden_size, dim, rngs=rngs,
+            max_num_embodiments, state_dim, action_hidden_size, dim,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim, dim, max_num_embodiments, rngs=rngs,
+            action_dim, dim, max_num_embodiments,
+            param_dtype=param_dtype, rngs=rngs,
         )
         self.action_decoder = CategorySpecificMLP(
-            max_num_embodiments, dim, action_hidden_size, action_dim, rngs=rngs,
+            max_num_embodiments, dim, action_hidden_size, action_dim,
+            param_dtype=param_dtype, rngs=rngs,
         )
 
     def _build_combined_rope(

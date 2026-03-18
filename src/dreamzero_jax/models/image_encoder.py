@@ -93,9 +93,9 @@ class VitAttentionBlock(nnx.Module):
         self.post_norm = post_norm
 
         kw = dict(dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.norm1 = nnx.LayerNorm(dim, epsilon=eps, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
         self.attn = VitSelfAttention(dim, num_heads, **kw)
-        self.norm2 = nnx.LayerNorm(dim, epsilon=eps, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
 
         mid_dim = int(dim * mlp_ratio)
         if activation == "quick_gelu":
@@ -181,17 +181,17 @@ class VisionTransformer(nnx.Module):
 
         # CLS token
         self.cls_embedding = nnx.Param(
-            gain * jax.random.normal(rngs.params(), (1, 1, dim))
+            (gain * jax.random.normal(rngs.params(), (1, 1, dim))).astype(param_dtype)
         )
 
         # Positional embedding: 1 CLS + num_patches
         num_pos = self.num_patches + 1
         self.pos_embedding = nnx.Param(
-            gain * jax.random.normal(rngs.params(), (1, num_pos, dim))
+            (gain * jax.random.normal(rngs.params(), (1, num_pos, dim))).astype(param_dtype)
         )
 
         # Pre-norm (before transformer blocks)
-        self.pre_norm = nnx.LayerNorm(dim, epsilon=eps, rngs=rngs) if pre_norm else None
+        self.pre_norm = nnx.LayerNorm(dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs) if pre_norm else None
 
         # Transformer blocks
         self.transformer = nnx.List([
@@ -203,12 +203,12 @@ class VisionTransformer(nnx.Module):
         ])
 
         # Post-norm
-        self.post_norm_layer = nnx.LayerNorm(dim, epsilon=eps, rngs=rngs)
+        self.post_norm_layer = nnx.LayerNorm(dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
 
         # Output head
         if pool_type == "token":
             self.head = nnx.Param(
-                gain * jax.random.normal(rngs.params(), (dim, out_dim))
+                (gain * jax.random.normal(rngs.params(), (dim, out_dim))).astype(param_dtype)
             )
         else:
             self.head = nnx.Linear(dim, out_dim, **kw)

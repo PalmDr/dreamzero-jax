@@ -207,8 +207,8 @@ class Attention(nnx.Module):
         )
 
         if qk_norm:
-            self.norm_q = nnx.RMSNorm(inner_dim, epsilon=eps, rngs=rngs)
-            self.norm_k = nnx.RMSNorm(inner_dim, epsilon=eps, rngs=rngs)
+            self.norm_q = nnx.RMSNorm(inner_dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
+            self.norm_k = nnx.RMSNorm(inner_dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(
         self,

@@ -77,14 +77,14 @@ class MLPProj(nnx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
-        self.norm_in = nnx.LayerNorm(in_dim, rngs=rngs)
+        self.norm_in = nnx.LayerNorm(in_dim, param_dtype=param_dtype, rngs=rngs)
         self.linear1 = nnx.Linear(
             in_dim, out_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
         self.linear2 = nnx.Linear(
             out_dim, out_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
-        self.norm_out = nnx.LayerNorm(out_dim, rngs=rngs)
+        self.norm_out = nnx.LayerNorm(out_dim, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.norm_in(x)
@@ -155,9 +155,9 @@ class WanI2VCrossAttention(nnx.Module):
         # QK norms
         self.qk_norm = qk_norm
         if qk_norm:
-            self.norm_q = nnx.RMSNorm(inner_dim, epsilon=eps, rngs=rngs)
-            self.norm_k_text = nnx.RMSNorm(inner_dim, epsilon=eps, rngs=rngs)
-            self.norm_k_img = nnx.RMSNorm(inner_dim, epsilon=eps, rngs=rngs)
+            self.norm_q = nnx.RMSNorm(inner_dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
+            self.norm_k_text = nnx.RMSNorm(inner_dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
+            self.norm_k_img = nnx.RMSNorm(inner_dim, epsilon=eps, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array, context: jax.Array) -> jax.Array:
         """
@@ -236,6 +236,8 @@ class WanDiTBlock(nnx.Module):
         self.use_pallas = use_pallas
 
         # Norms for self-attention and FFN (no affine — modulated externally)
+        # Note: use_scale=False, use_bias=False means no learnable params,
+        # but we still pass param_dtype for consistency.
         self.norm1 = nnx.LayerNorm(
             dim, use_bias=False, use_scale=False, rngs=rngs
         )
@@ -246,7 +248,7 @@ class WanDiTBlock(nnx.Module):
         # Optional norm before cross-attention
         self.cross_attn_norm = cross_attn_norm
         if cross_attn_norm:
-            self.norm3 = nnx.LayerNorm(dim, rngs=rngs)
+            self.norm3 = nnx.LayerNorm(dim, param_dtype=param_dtype, rngs=rngs)
 
         # Self-attention (chunked when chunk_size is set and seq > chunk_size)
         self.self_attn = Attention(
@@ -275,7 +277,7 @@ class WanDiTBlock(nnx.Module):
 
         # 6-parameter learnable modulation bias: (1, 6, dim)
         self.modulation = nnx.Param(
-            jax.random.normal(rngs.params(), (1, 6, dim)) / math.sqrt(dim)
+            (jax.random.normal(rngs.params(), (1, 6, dim)) / math.sqrt(dim)).astype(param_dtype)
         )
 
     def __call__(
@@ -365,7 +367,7 @@ class WanDiTHead(nnx.Module):
         )
         # 2-parameter learnable modulation bias: (1, 2, dim)
         self.modulation = nnx.Param(
-            jax.random.normal(rngs.params(), (1, 2, dim)) / math.sqrt(dim)
+            (jax.random.normal(rngs.params(), (1, 2, dim)) / math.sqrt(dim)).astype(param_dtype)
         )
 
     def __call__(self, x: jax.Array, t: jax.Array) -> jax.Array:
