@@ -221,6 +221,7 @@ def generate_staged(
     key: jax.Array,
     mesh: jax.sharding.Mesh | None = None,
     verbose: bool = True,
+    quantize_int8: bool = False,
 ):
     """Staged inference: encoders and DiT are never loaded simultaneously.
 
@@ -288,6 +289,11 @@ def generate_staged(
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
     with cpu_ctx:
         dit = _create_dit(config, rngs)
+
+    if quantize_int8:
+        from dreamzero_jax.utils.quantize import quantize_model
+        _log("Phase 2: quantizing DiT to INT8")
+        quantize_model(dit)
 
     if mesh is not None:
         _log("Phase 2: sharding DiT weights to TPU")
