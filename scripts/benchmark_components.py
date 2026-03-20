@@ -366,6 +366,7 @@ def bench_vae_encode(
     iters: int = 10,
     use_pallas: bool = False,  # unused, kept for API consistency
     mesh: Mesh | None = None,
+    quantize_int8: bool = False,  # unused, kept for API consistency
 ) -> BenchmarkResult:
     """Benchmark VAE encode: 33 frames @ 320x176."""
     dtype = resolve_dtype(dtype_str)
@@ -412,6 +413,7 @@ def bench_vae_decode(
     iters: int = 10,
     use_pallas: bool = False,  # unused, kept for API consistency
     mesh: Mesh | None = None,
+    quantize_int8: bool = False,  # unused, kept for API consistency
 ) -> BenchmarkResult:
     """Benchmark VAE decode: latents -> 33 frames."""
     dtype = resolve_dtype(dtype_str)
@@ -508,6 +510,14 @@ def bench_full_inference(
             )
         raise
 
+    if quantize_int8:
+        print("  Applying INT8 weight quantization...")
+        savings = estimate_memory_savings(model)
+        model = quantize_model(model)
+        print(f"  Weight memory: {savings['original_bytes'] / 1e9:.2f} GB -> "
+              f"{savings['quantized_bytes'] / 1e9:.2f} GB "
+              f"({savings['savings_pct']:.0f}% reduction)")
+
     # Shard model weights across devices if mesh is provided
     if mesh is not None:
         print("  Sharding DreamZero model weights across devices...")
@@ -574,6 +584,7 @@ def bench_full_inference_offload(
     use_remat: bool = False,
     mesh: Mesh | None = None,
     scan_loop: bool = False,  # unused, kept for API consistency
+    quantize_int8: bool = False,
 ) -> BenchmarkResult:
     """Benchmark DreamZero.generate_offload (encoder offloading).
 
@@ -630,6 +641,8 @@ def bench_full_inference_offload(
         rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
         with init_ctx:
             model = DreamZero(config, rngs=rngs)
+        if quantize_int8:
+            quantize_model(model)
         if mesh is not None:
             model = shard_params(model, mesh, param_dtype=dtype)
         result = model.generate_offload(
@@ -746,6 +759,7 @@ def run_with_oom_fallback(
     use_remat: bool = False,
     mesh: Mesh | None = None,
     scan_loop: bool = False,
+    quantize_int8: bool = False,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
     fallback_layers = [num_layers, 16, 8]
@@ -764,6 +778,7 @@ def run_with_oom_fallback(
                 use_remat=use_remat,
                 mesh=mesh,
                 scan_loop=scan_loop,
+                quantize_int8=quantize_int8,
             )
             if result.note and "OOM" in result.note:
                 print(f"  OOM at {nl} layers, trying fewer...")
@@ -863,6 +878,11 @@ Components:
         help="When running full_inference, use generate_offload() to delete encoder "
              "weights after encoding, freeing ~1.6 GB/chip for DiT activations.",
     )
+    parser.add_argument(
+        "--quantize-int8", action="store_true",
+        help="Apply INT8 weight-only quantization (post-training). Halves weight memory "
+             "by storing Linear kernels as int8 + per-channel bf16 scales.",
+    )
     args = parser.parse_args()
 
     # --offload-encoders remaps full_inference -> full_inference_offload
@@ -901,6 +921,8 @@ Components:
         print("Scan denoising loop: ENABLED (generate_scan with Euler + jax.lax.scan)")
     if args.offload_encoders:
         print("Encoder offloading: ENABLED (delete text/image/VAE weights after encoding)")
+    if args.quantize_int8:
+        print("INT8 quantization: ENABLED (weight-only, per-channel symmetric)")
 
     # --- Tensor parallelism mesh ---
     mesh = None
@@ -936,6 +958,7 @@ Components:
                 use_remat=args.use_remat,
                 mesh=mesh,
                 scan_loop=args.scan_loop if name == "full_inference" else False,
+                quantize_int8=args.quantize_int8,
             )
         else:
             print(f"\n[{name}]")
@@ -947,6 +970,7 @@ Components:
                 iters=args.iters,
                 use_pallas=args.use_pallas,
                 mesh=mesh,
+                quantize_int8=args.quantize_int8,
             )
 
         results.append(result)

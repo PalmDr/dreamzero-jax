@@ -374,7 +374,8 @@ def shard_params(
         else:
             arr = value
 
-        if param_dtype is not None and arr.dtype != param_dtype:
+        # Skip dtype cast for int8 quantized weights (preserve int8 storage)
+        if param_dtype is not None and arr.dtype != param_dtype and arr.dtype != jnp.int8:
             arr = arr.astype(param_dtype)
 
         pspec = get_partition_spec(path, arr.shape, mesh)
