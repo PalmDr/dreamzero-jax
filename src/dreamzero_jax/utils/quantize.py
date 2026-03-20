@@ -163,7 +163,9 @@ def quantize_model(model: nnx.Module) -> nnx.Module:
     Returns:
         The same model reference (modified in-place).
     """
+    import gc
     quantized, skipped = _walk_and_quantize(model)
+    gc.collect()
     logger.info(
         "INT8 quantization: %d layers quantized, %d skipped",
         quantized, skipped,

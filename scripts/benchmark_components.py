@@ -267,8 +267,9 @@ def bench_full_dit(
     use_scan: bool = False,
     use_remat: bool = False,
     mesh: Mesh | None = None,
-    scan_loop: bool = False,  # unused, kept for API consistency with run_with_oom_fallback
+    scan_loop: bool = False,
     quantize_int8: bool = False,
+    use_cfg: bool = True,  # unused, kept for API consistency with run_with_oom_fallback
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
     dtype = resolve_dtype(dtype_str)
@@ -467,6 +468,7 @@ def bench_full_inference(
     mesh: Mesh | None = None,
     scan_loop: bool = False,
     quantize_int8: bool = False,
+    use_cfg: bool = True,
 ) -> BenchmarkResult:
     """Benchmark full DreamZero.generate (16 steps, CFG).
 
@@ -542,35 +544,35 @@ def bench_full_inference(
         state = jax.device_put(state, replicated)
         embodiment_id = jax.device_put(embodiment_id, replicated)
 
-    # Use nnx.jit so model weights are traced as state, not captured as constants.
     if scan_loop:
-        # generate_scan(): Euler scheduler + jax.lax.scan (single XLA dispatch)
         @nnx.jit
         def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
             return model.generate_scan(
                 video, token_ids, state, embodiment_id,
                 attention_mask=attention_mask,
+                use_cfg=use_cfg,
                 key=key,
             )
     else:
-        # generate(): UniPC scheduler + Python for-loop (N dispatches)
         @nnx.jit
         def run(model, video, token_ids, state, embodiment_id, attention_mask, key):
             return model.generate(
                 video, token_ids, state, embodiment_id,
                 attention_mask=attention_mask,
+                use_cfg=use_cfg,
                 key=key,
             )
 
     loop_str = "scan" if scan_loop else "PyLoop"
+    cfg_str = "" if use_cfg else ", no-CFG"
     gen_key = jax.random.PRNGKey(99)
     if mesh is not None:
         gen_key = jax.device_put(gen_key, NamedSharding(mesh, P()))
-    print(f"  Running full inference benchmark [{loop_str}] ({warmup} warmup + {iters} timed)...")
+    print(f"  Running full inference benchmark [{loop_str}{cfg_str}] ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
         run, model, video, token_ids, state, embodiment_id, attention_mask, gen_key,
         warmup=warmup, iters=iters,
-        name=f"Full inference ({num_layers}L, 16 steps, {loop_str})",
+        name=f"Full inference ({num_layers}L, 16 steps, {loop_str}{cfg_str})",
     )
 
 
@@ -584,8 +586,9 @@ def bench_full_inference_offload(
     use_scan: bool = False,
     use_remat: bool = False,
     mesh: Mesh | None = None,
-    scan_loop: bool = False,  # unused, kept for API consistency
+    scan_loop: bool = False,
     quantize_int8: bool = False,
+    use_cfg: bool = True,
 ) -> BenchmarkResult:
     """Benchmark DreamZero.generate_offload (encoder offloading).
 
@@ -649,6 +652,7 @@ def bench_full_inference_offload(
         result = model.generate_offload(
             video, token_ids, state, embodiment_id,
             attention_mask=attention_mask,
+            use_cfg=use_cfg,
             key=gen_key,
         )
         jax.block_until_ready(result)
@@ -697,6 +701,7 @@ def bench_full_inference_staged(
     mesh: Mesh | None = None,
     scan_loop: bool = False,
     quantize_int8: bool = False,
+    use_cfg: bool = True,
 ) -> BenchmarkResult:
     """Benchmark staged inference: encoders and DiT never coexist in HBM.
 
@@ -751,12 +756,14 @@ def bench_full_inference_staged(
         return generate_staged(
             config, video, token_ids, state, embodiment_id,
             attention_mask=attention_mask,
+            use_cfg=use_cfg,
             key=gen_key,
             mesh=mesh,
             verbose=verbose,
         )
 
-    print(f"  Initializing staged inference benchmark ({num_layers}L)")
+    cfg_str = "" if use_cfg else ", no-CFG"
+    print(f"  Initializing staged inference benchmark ({num_layers}L{cfg_str})")
     print(f"  Running staged benchmark ({warmup} warmup + {iters} timed)...")
 
     for i in range(warmup):
@@ -776,8 +783,9 @@ def bench_full_inference_staged(
     hbm_gb = get_hbm_usage_gb()
     arr = np.array(timings)
 
+    cfg_tag = "" if use_cfg else ", no-CFG"
     return BenchmarkResult(
-        name=f"Full inference staged ({num_layers}L, 16 steps, scan)",
+        name=f"Full inference staged ({num_layers}L, 16 steps, scan{cfg_tag})",
         mean_ms=float(np.mean(arr)),
         std_ms=float(np.std(arr)),
         min_ms=float(np.min(arr)),
@@ -863,6 +871,7 @@ def run_with_oom_fallback(
     mesh: Mesh | None = None,
     scan_loop: bool = False,
     quantize_int8: bool = False,
+    use_cfg: bool = True,
 ) -> BenchmarkResult:
     """Run a benchmark, falling back to reduced layers on OOM."""
     fallback_layers = [num_layers, 16, 8]
@@ -882,6 +891,7 @@ def run_with_oom_fallback(
                 mesh=mesh,
                 scan_loop=scan_loop,
                 quantize_int8=quantize_int8,
+                use_cfg=use_cfg,
             )
             if result.note and "OOM" in result.note:
                 print(f"  OOM at {nl} layers, trying fewer...")
@@ -988,6 +998,12 @@ Components:
         help="Apply INT8 weight-only quantization (post-training). Halves weight memory "
              "by storing Linear kernels as int8 + per-channel bf16 scales.",
     )
+    parser.add_argument(
+        "--no-cfg", action="store_true",
+        help="Disable classifier-free guidance during denoising. Runs only the "
+             "conditional pass per step, halving activation memory. Critical for "
+             "fitting 40L 14B on v5e-8.",
+    )
     args = parser.parse_args()
 
     # --offload-encoders remaps full_inference -> full_inference_offload
@@ -1028,6 +1044,10 @@ Components:
         print("Encoder offloading: ENABLED (delete text/image/VAE weights after encoding)")
     if args.quantize_int8:
         print("INT8 quantization: ENABLED (weight-only, per-channel symmetric)")
+    if args.no_cfg:
+        print("Classifier-free guidance: DISABLED (no-CFG, 1x DiT pass per step)")
+
+    use_cfg = not args.no_cfg
 
     # --- Tensor parallelism mesh ---
     mesh = None
@@ -1064,6 +1084,7 @@ Components:
                 mesh=mesh,
                 scan_loop=args.scan_loop if name == "full_inference" else False,
                 quantize_int8=args.quantize_int8,
+                use_cfg=use_cfg,
             )
         else:
             print(f"\n[{name}]")

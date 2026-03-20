@@ -130,8 +130,13 @@ def _run_encoding(text_enc, img_enc, vae, video, token_ids, attention_mask, has_
 
 
 def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
-                      state, embodiment_id, num_steps, cfg, *, key):
-    """Run the Euler-scan denoising loop with a standalone DiT."""
+                      state, embodiment_id, num_steps, cfg, *, key,
+                      use_cfg=True):
+    """Run the Euler-scan denoising loop with a standalone DiT.
+
+    When ``use_cfg=False``, runs only the conditional pass per step,
+    halving activation memory.
+    """
     B = latents.shape[0]
     T_lat = latents.shape[1]
     f = T_lat // config.patch_size[0]
@@ -142,8 +147,6 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
         state = jnp.pad(state, ((0, 0), (0, num_blocks - actual), (0, 0)))
     elif actual > num_blocks:
         state = state[:, :num_blocks]
-
-    null_prompt = jnp.zeros_like(prompt_emb)
 
     key_vid, key_act = jax.random.split(key)
     noisy_video = jax.random.normal(key_vid, latents.shape)
@@ -175,34 +178,61 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
         sched_action.sigmas_next,
     )
 
-    @nnx.jit
-    def _run_scan(model, noisy_vid, noisy_act, st, emb_id, p_emb, n_prompt, c_emb):
-        def _step(carry, xs):
-            nv, na = carry
-            (tv, ta, sv, svn, sa, san) = xs
-            tv_b = jnp.broadcast_to(tv, (B,))
-            ta_b = jnp.broadcast_to(ta, (B,))
+    if use_cfg:
+        null_prompt = jnp.zeros_like(prompt_emb)
 
-            vc, ac = model(
-                nv, tv_b, p_emb, st, emb_id, na,
-                timestep_action=ta_b, clip_emb=c_emb,
-            )
-            vu, au = model(
-                nv, tv_b, n_prompt, st, emb_id, na,
-                timestep_action=ta_b, clip_emb=c_emb,
-            )
-            vp = vu + cfg * (vc - vu)
-            nv_next = euler_step(vp, nv, sv, svn)
-            na_next = euler_step(ac, na, sa, san)
-            return (nv_next, na_next), None
+        @nnx.jit
+        def _run_scan(model, noisy_vid, noisy_act, st, emb_id, p_emb, n_prompt, c_emb):
+            def _step(carry, xs):
+                nv, na = carry
+                (tv, ta, sv, svn, sa, san) = xs
+                tv_b = jnp.broadcast_to(tv, (B,))
+                ta_b = jnp.broadcast_to(ta, (B,))
 
-        (fv, fa), _ = jax.lax.scan(_step, (noisy_vid, noisy_act), scan_xs)
-        return fv, fa
+                vc, ac = model(
+                    nv, tv_b, p_emb, st, emb_id, na,
+                    timestep_action=ta_b, clip_emb=c_emb,
+                )
+                vu, au = model(
+                    nv, tv_b, n_prompt, st, emb_id, na,
+                    timestep_action=ta_b, clip_emb=c_emb,
+                )
+                vp = vu + cfg * (vc - vu)
+                nv_next = euler_step(vp, nv, sv, svn)
+                na_next = euler_step(ac, na, sa, san)
+                return (nv_next, na_next), None
 
-    final_video, final_actions = _run_scan(
-        dit, noisy_video, noisy_actions,
-        state, embodiment_id, prompt_emb, null_prompt, clip_emb,
-    )
+            (fv, fa), _ = jax.lax.scan(_step, (noisy_vid, noisy_act), scan_xs)
+            return fv, fa
+
+        final_video, final_actions = _run_scan(
+            dit, noisy_video, noisy_actions,
+            state, embodiment_id, prompt_emb, null_prompt, clip_emb,
+        )
+    else:
+        @nnx.jit
+        def _run_scan_no_cfg(model, noisy_vid, noisy_act, st, emb_id, p_emb, c_emb):
+            def _step(carry, xs):
+                nv, na = carry
+                (tv, ta, sv, svn, sa, san) = xs
+                tv_b = jnp.broadcast_to(tv, (B,))
+                ta_b = jnp.broadcast_to(ta, (B,))
+
+                vp, ap = model(
+                    nv, tv_b, p_emb, st, emb_id, na,
+                    timestep_action=ta_b, clip_emb=c_emb,
+                )
+                nv_next = euler_step(vp, nv, sv, svn)
+                na_next = euler_step(ap, na, sa, san)
+                return (nv_next, na_next), None
+
+            (fv, fa), _ = jax.lax.scan(_step, (noisy_vid, noisy_act), scan_xs)
+            return fv, fa
+
+        final_video, final_actions = _run_scan_no_cfg(
+            dit, noisy_video, noisy_actions,
+            state, embodiment_id, prompt_emb, clip_emb,
+        )
 
     from dreamzero_jax.models.dreamzero import InferenceOutput
     return InferenceOutput(action_pred=final_actions, video_pred=final_video)
@@ -217,6 +247,7 @@ def generate_staged(
     attention_mask: jax.Array | None = None,
     num_inference_steps: int | None = None,
     cfg_scale: float | None = None,
+    use_cfg: bool = True,
     *,
     key: jax.Array,
     mesh: jax.sharding.Mesh | None = None,
@@ -231,6 +262,10 @@ def generate_staged(
     Peak weight memory is max(encoders, DiT) ~ 4.82 GB/chip instead of
     the ~13.65 GB sum that ``generate_offload`` requires.
 
+    When ``use_cfg=False``, the denoising loop runs only the conditional
+    pass per step, halving activation memory. Critical for fitting 40L
+    14B on v5e-8.
+
     Args:
         config: DreamZeroConfig instance.
         video: Conditioning video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
@@ -240,6 +275,8 @@ def generate_staged(
         attention_mask: ``(B, L)`` text attention mask.
         num_inference_steps: Override number of denoising steps.
         cfg_scale: Override classifier-free guidance scale.
+        use_cfg: When False, skip the unconditional pass and CFG
+            combination. The DiT runs once per step instead of twice.
         key: PRNG key for noise initialization.
         mesh: Device mesh for sharding. If None, no sharding is applied.
         verbose: Print HBM usage at each phase boundary.
@@ -282,7 +319,9 @@ def generate_staged(
 
     del text_enc, img_enc, vae
     gc.collect()
-    _log("Phase 1: encoders deleted")
+    jax.clear_caches()
+    gc.collect()
+    _log("Phase 1: encoders deleted (caches cleared)")
 
     # ---- Phase 2: DiT ----
     _log("Phase 2: creating DiT on CPU")
@@ -290,22 +329,24 @@ def generate_staged(
     with cpu_ctx:
         dit = _create_dit(config, rngs)
 
-    if quantize_int8:
-        from dreamzero_jax.utils.quantize import quantize_model
-        _log("Phase 2: quantizing DiT to INT8")
-        quantize_model(dit)
+        if quantize_int8:
+            from dreamzero_jax.utils.quantize import quantize_model
+            _log("Phase 2: quantizing DiT to INT8 (on CPU)")
+            quantize_model(dit)
 
     if mesh is not None:
         _log("Phase 2: sharding DiT weights to TPU")
         dit = shard_params(dit, mesh, param_dtype=config.param_dtype)
 
-    _log("Phase 2: running denoising")
+    cfg_str = "CFG" if use_cfg else "no-CFG"
+    _log(f"Phase 2: running denoising ({cfg_str})")
     result = _run_denoise_scan(
         dit, config,
         latents, prompt_emb, clip_emb,
         state, embodiment_id,
         num_steps, cfg,
         key=key,
+        use_cfg=use_cfg,
     )
     jax.block_until_ready(result)
     _log("Phase 2: denoising complete")

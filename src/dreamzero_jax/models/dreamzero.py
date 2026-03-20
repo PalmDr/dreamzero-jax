@@ -411,12 +411,16 @@ class DreamZero(nnx.Module):
         cfg: float,
         *,
         key: jax.Array,
+        use_cfg: bool = True,
     ) -> InferenceOutput:
-        """Run the Euler scan denoising loop (shared by generate_scan and generate_offload)."""
+        """Run the Euler scan denoising loop (shared by generate_scan and generate_offload).
+
+        When ``use_cfg=False``, skips the unconditional DiT pass entirely —
+        halving the effective batch and activation memory per denoising step.
+        """
         B = latents.shape[0]
         num_blocks = self._compute_num_blocks(latents)
         state = self._validate_state(state, num_blocks)
-        null_prompt = jnp.zeros_like(prompt_emb)
 
         key_vid, key_act = jax.random.split(key)
         noisy_video = jax.random.normal(key_vid, latents.shape)
@@ -448,34 +452,55 @@ class DreamZero(nnx.Module):
             sched_action.sigmas_next,
         )
 
-        def _scan_step(carry, xs):
-            noisy_vid, noisy_act = carry
-            (t_vid_scalar, t_act_scalar,
-             sigma_vid, sigma_vid_next,
-             sigma_act, sigma_act_next) = xs
+        if use_cfg:
+            null_prompt = jnp.zeros_like(prompt_emb)
 
-            t_video = jnp.broadcast_to(t_vid_scalar, (B,))
-            t_act = jnp.broadcast_to(t_act_scalar, (B,))
+            def _scan_step(carry, xs):
+                noisy_vid, noisy_act = carry
+                (t_vid_scalar, t_act_scalar,
+                 sigma_vid, sigma_vid_next,
+                 sigma_act, sigma_act_next) = xs
 
-            vid_cond, act_cond = self.dit(
-                noisy_vid, t_video, prompt_emb,
-                state, embodiment_id, noisy_act,
-                timestep_action=t_act,
-                clip_emb=clip_emb,
-            )
+                t_video = jnp.broadcast_to(t_vid_scalar, (B,))
+                t_act = jnp.broadcast_to(t_act_scalar, (B,))
 
-            vid_uncond, act_uncond = self.dit(
-                noisy_vid, t_video, null_prompt,
-                state, embodiment_id, noisy_act,
-                timestep_action=t_act,
-                clip_emb=clip_emb,
-            )
+                vid_cond, act_cond = self.dit(
+                    noisy_vid, t_video, prompt_emb,
+                    state, embodiment_id, noisy_act,
+                    timestep_action=t_act,
+                    clip_emb=clip_emb,
+                )
+                vid_uncond, act_uncond = self.dit(
+                    noisy_vid, t_video, null_prompt,
+                    state, embodiment_id, noisy_act,
+                    timestep_action=t_act,
+                    clip_emb=clip_emb,
+                )
 
-            vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
-            noisy_vid_next = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
-            noisy_act_next = euler_step(act_cond, noisy_act, sigma_act, sigma_act_next)
+                vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
+                nv = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
+                na = euler_step(act_cond, noisy_act, sigma_act, sigma_act_next)
+                return (nv, na), None
+        else:
+            def _scan_step(carry, xs):
+                noisy_vid, noisy_act = carry
+                (t_vid_scalar, t_act_scalar,
+                 sigma_vid, sigma_vid_next,
+                 sigma_act, sigma_act_next) = xs
 
-            return (noisy_vid_next, noisy_act_next), None
+                t_video = jnp.broadcast_to(t_vid_scalar, (B,))
+                t_act = jnp.broadcast_to(t_act_scalar, (B,))
+
+                vid_pred, act_pred = self.dit(
+                    noisy_vid, t_video, prompt_emb,
+                    state, embodiment_id, noisy_act,
+                    timestep_action=t_act,
+                    clip_emb=clip_emb,
+                )
+
+                nv = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
+                na = euler_step(act_pred, noisy_act, sigma_act, sigma_act_next)
+                return (nv, na), None
 
         (final_video, final_actions), _ = jax.lax.scan(
             _scan_step,
@@ -522,6 +547,7 @@ class DreamZero(nnx.Module):
         attention_mask: jax.Array | None = None,
         num_inference_steps: int | None = None,
         cfg_scale: float | None = None,
+        use_cfg: bool = True,
         *,
         key: jax.Array,
     ) -> InferenceOutput:
@@ -530,8 +556,8 @@ class DreamZero(nnx.Module):
         Uses the UniPC multistep scheduler for denoising with
         classifier-free guidance (unconditional = zero text embedding).
 
-        Note: This is a basic implementation without KV caching.
-        For production inference, use KV-cached autoregressive generation.
+        When ``use_cfg=False``, skips the unconditional pass entirely,
+        halving activation memory per denoising step.
 
         Args:
             video: Conditioning video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
@@ -541,6 +567,8 @@ class DreamZero(nnx.Module):
             attention_mask: ``(B, L)`` text attention mask.
             num_inference_steps: Override number of denoising steps.
             cfg_scale: Override classifier-free guidance scale.
+            use_cfg: When False, skip the unconditional pass and CFG
+                combination. The DiT runs once per step instead of twice.
             key: PRNG key for noise initialization.
 
         Returns:
@@ -550,20 +578,16 @@ class DreamZero(nnx.Module):
         cfg = cfg_scale or self.config.cfg_scale
         B = video.shape[0]
 
-        # --- Encode conditioning ---
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0])
 
-        # --- Validate state against actual latent temporal dim ---
         num_blocks = self._compute_num_blocks(latents)
         state = self._validate_state(state, num_blocks)
 
-        # Null prompt for unconditional branch (zeros)
-        null_prompt = jnp.zeros_like(prompt_emb)
+        if use_cfg:
+            null_prompt = jnp.zeros_like(prompt_emb)
 
-        # --- Initialize noise ---
-        # Video noise shape matches latent spatial dims
         key_vid, key_act = jax.random.split(key)
         noisy_video = jax.random.normal(key_vid, latents.shape)
 
@@ -575,7 +599,6 @@ class DreamZero(nnx.Module):
             key_act, (B, total_actions, self.config.action_dim),
         )
 
-        # --- Scheduler setup ---
         sched = FlowUniPCMultistepScheduler(
             shift=self.config.scheduler_shift,
             num_train_timesteps=self.config.num_train_timesteps,
@@ -588,13 +611,11 @@ class DreamZero(nnx.Module):
         )
         sched_action.set_timesteps(num_steps)
 
-        # --- Denoising loop ---
         for i, t in enumerate(sched.timesteps):
             t_action = sched_action.timesteps[i]
             t_video = jnp.broadcast_to(jnp.asarray(t, dtype=jnp.float32), (B,))
             t_act = jnp.broadcast_to(jnp.asarray(t_action, dtype=jnp.float32), (B,))
 
-            # Conditional prediction
             vid_cond, act_cond = self.dit(
                 noisy_video, t_video, prompt_emb,
                 state, embodiment_id, noisy_actions,
@@ -602,18 +623,17 @@ class DreamZero(nnx.Module):
                 clip_emb=clip_emb if self.config.has_image_input else None,
             )
 
-            # Unconditional prediction (null text)
-            vid_uncond, act_uncond = self.dit(
-                noisy_video, t_video, null_prompt,
-                state, embodiment_id, noisy_actions,
-                timestep_action=t_act,
-                clip_emb=clip_emb if self.config.has_image_input else None,
-            )
+            if use_cfg:
+                vid_uncond, _ = self.dit(
+                    noisy_video, t_video, null_prompt,
+                    state, embodiment_id, noisy_actions,
+                    timestep_action=t_act,
+                    clip_emb=clip_emb if self.config.has_image_input else None,
+                )
+                vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
+            else:
+                vid_pred = vid_cond
 
-            # Classifier-free guidance
-            vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
-
-            # Step schedulers
             vid_result = sched.step(vid_pred, t, noisy_video, step_index=i)
             noisy_video = vid_result.prev_sample
 
@@ -633,6 +653,7 @@ class DreamZero(nnx.Module):
         attention_mask: jax.Array | None = None,
         num_inference_steps: int | None = None,
         cfg_scale: float | None = None,
+        use_cfg: bool = True,
         *,
         key: jax.Array,
     ) -> InferenceOutput:
@@ -640,14 +661,10 @@ class DreamZero(nnx.Module):
 
         Functionally equivalent to :meth:`generate` but uses a simple Euler
         scheduler (instead of UniPC multistep) wrapped in ``jax.lax.scan``.
-        This eliminates Python dispatch overhead (~0.5 ms per step on TPU)
-        and allows XLA to compile the full denoising loop as a single fused
-        program.
 
-        Trade-off: Euler is a first-order solver, so it may need more steps
-        than UniPC (second-order) to reach the same quality. However, the
-        per-step dispatch savings often outweigh this, especially at
-        step counts >= 16.
+        When ``use_cfg=False``, skips the unconditional pass entirely,
+        halving activation memory per denoising step. Critical for fitting
+        40L 14B on v5e-8.
 
         Args:
             video: Conditioning video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
@@ -657,6 +674,8 @@ class DreamZero(nnx.Module):
             attention_mask: ``(B, L)`` text attention mask.
             num_inference_steps: Override number of denoising steps.
             cfg_scale: Override classifier-free guidance scale.
+            use_cfg: When False, skip the unconditional pass and CFG
+                combination. The DiT runs once per step instead of twice.
             key: PRNG key for noise initialization.
 
         Returns:
@@ -674,6 +693,7 @@ class DreamZero(nnx.Module):
             state, embodiment_id,
             num_steps, cfg,
             key=key,
+            use_cfg=use_cfg,
         )
 
     # -----------------------------------------------------------------
@@ -719,6 +739,7 @@ class DreamZero(nnx.Module):
         attention_mask: jax.Array | None = None,
         num_inference_steps: int | None = None,
         cfg_scale: float | None = None,
+        use_cfg: bool = True,
         *,
         key: jax.Array,
     ) -> InferenceOutput:
@@ -726,8 +747,10 @@ class DreamZero(nnx.Module):
 
         Identical to :meth:`generate_scan` except that after the encoding
         phase, all encoder weights (text_encoder, image_encoder, vae) are
-        deleted from TPU memory. This frees ~1.6 GB/chip on v5e-8, enough
-        headroom for the DiT denoising loop activations.
+        deleted from TPU memory.
+
+        When ``use_cfg=False``, skips the unconditional pass entirely,
+        halving activation memory per denoising step.
 
         WARNING: This method is destructive — after calling it the model's
         encoders are gone. Re-initialize or re-load weights before calling
@@ -741,6 +764,8 @@ class DreamZero(nnx.Module):
             attention_mask: ``(B, L)`` text attention mask.
             num_inference_steps: Override number of denoising steps.
             cfg_scale: Override classifier-free guidance scale.
+            use_cfg: When False, skip the unconditional pass and CFG
+                combination. The DiT runs once per step instead of twice.
             key: PRNG key for noise initialization.
 
         Returns:
@@ -761,6 +786,7 @@ class DreamZero(nnx.Module):
             state, embodiment_id,
             num_steps, cfg,
             key=key,
+            use_cfg=use_cfg,
         )
 
 
