@@ -45,9 +45,8 @@ class QuantizedLinear(nnx.Module):
         self.dtype = dtype
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Dequantize: int8 -> compute dtype, then scale
         w = self.kernel_i8.value.astype(self.dtype) * self.scales.value
-        y = x @ w
+        y = (x @ w).astype(self.dtype)
         if self.bias is not None:
             y = y + self.bias.value.astype(self.dtype)
         return y
