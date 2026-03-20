@@ -49,6 +49,7 @@ from dreamzero_jax.models.dit import WanDiT, WanDiTBlock
 from dreamzero_jax.models.vae import WanVideoVAE
 from dreamzero_jax.models.action_head import CausalWanDiT
 from dreamzero_jax.models.dreamzero import DreamZero, DreamZeroConfig
+from dreamzero_jax.models.staged_inference import generate_staged
 from dreamzero_jax.utils.sharding import create_mesh, shard_params, REPLICATED
 from dreamzero_jax.utils.quantize import quantize_model, estimate_memory_savings
 
@@ -684,6 +685,107 @@ def bench_full_inference_offload(
     )
 
 
+def bench_full_inference_staged(
+    batch_size: int = 1,
+    num_layers: int = 40,
+    dtype_str: str = "bf16",
+    warmup: int = 3,
+    iters: int = 10,
+    use_pallas: bool = False,
+    use_scan: bool = False,
+    use_remat: bool = False,
+    mesh: Mesh | None = None,
+    scan_loop: bool = False,
+    quantize_int8: bool = False,
+) -> BenchmarkResult:
+    """Benchmark staged inference: encoders and DiT never coexist in HBM.
+
+    Phase 1: create encoders on CPU -> shard -> encode -> delete
+    Phase 2: create DiT on CPU -> shard -> denoise -> return
+    """
+    dtype = resolve_dtype(dtype_str)
+
+    config = DreamZeroConfig(
+        dim=CONFIG_14B["dim"],
+        ffn_dim=CONFIG_14B["ffn_dim"],
+        num_heads=CONFIG_14B["num_heads"],
+        num_layers=num_layers,
+        freq_dim=CONFIG_14B["freq_dim"],
+        text_dim=CONFIG_14B["text_dim"],
+        patch_size=CONFIG_14B["patch_size"],
+        in_channels=CONFIG_14B["in_channels"],
+        out_channels=CONFIG_14B["out_channels"],
+        has_image_input=True,
+        num_inference_steps=16,
+        cfg_scale=5.0,
+        use_scan=use_scan,
+        use_remat=use_remat,
+        dtype=dtype,
+        param_dtype=dtype,
+    )
+
+    key = jax.random.PRNGKey(42)
+    k1, k2 = jax.random.split(key)
+    video = jax.random.normal(
+        k1, (batch_size, VIDEO_FRAMES, VIDEO_H, VIDEO_W, 3), dtype=dtype,
+    )
+    token_ids = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
+    attention_mask = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
+    num_blocks = LATENT_T // config.num_frames_per_block
+    state = jax.random.normal(
+        k2, (batch_size, num_blocks, config.state_dim), dtype=jnp.float32,
+    )
+    embodiment_id = jnp.zeros((batch_size,), dtype=jnp.int32)
+    gen_key = jax.random.PRNGKey(99)
+
+    if mesh is not None:
+        replicated = NamedSharding(mesh, P())
+        video = jax.device_put(video, replicated)
+        token_ids = jax.device_put(token_ids, replicated)
+        attention_mask = jax.device_put(attention_mask, replicated)
+        state = jax.device_put(state, replicated)
+        embodiment_id = jax.device_put(embodiment_id, replicated)
+        gen_key = jax.device_put(gen_key, replicated)
+
+    def _run_once(verbose: bool = False):
+        return generate_staged(
+            config, video, token_ids, state, embodiment_id,
+            attention_mask=attention_mask,
+            key=gen_key,
+            mesh=mesh,
+            verbose=verbose,
+        )
+
+    print(f"  Initializing staged inference benchmark ({num_layers}L)")
+    print(f"  Running staged benchmark ({warmup} warmup + {iters} timed)...")
+
+    for i in range(warmup):
+        result = _run_once(verbose=(i == 0))
+        jax.block_until_ready(result)
+
+    reset_hbm_peak()
+
+    timings = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        result = _run_once()
+        jax.block_until_ready(result)
+        t1 = time.perf_counter()
+        timings.append((t1 - t0) * 1000.0)
+
+    hbm_gb = get_hbm_usage_gb()
+    arr = np.array(timings)
+
+    return BenchmarkResult(
+        name=f"Full inference staged ({num_layers}L, 16 steps, scan)",
+        mean_ms=float(np.mean(arr)),
+        std_ms=float(np.std(arr)),
+        min_ms=float(np.min(arr)),
+        max_ms=float(np.max(arr)),
+        hbm_gb=hbm_gb,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Component registry
 # ---------------------------------------------------------------------------
@@ -695,6 +797,7 @@ COMPONENTS = {
     "vae_decode": bench_vae_decode,
     "full_inference": bench_full_inference,
     "full_inference_offload": bench_full_inference_offload,
+    "full_inference_staged": bench_full_inference_staged,
 }
 
 
@@ -818,13 +921,15 @@ Components:
   vae_decode              VAE decode: latents -> 33 frames
   full_inference          Full DreamZero.generate (16 steps, CFG)
   full_inference_offload  Full inference with encoder offloading (frees ~1.6 GB/chip)
+  full_inference_staged   Staged init: encoders and DiT never coexist in HBM
   all                     Run all of the above
 """,
     )
     parser.add_argument(
         "--component", type=str, default="all",
         choices=["single_block", "full_dit", "vae_encode", "vae_decode",
-                 "full_inference", "full_inference_offload", "all"],
+                 "full_inference", "full_inference_offload",
+                 "full_inference_staged", "all"],
         help="Which component to benchmark (default: all)",
     )
     parser.add_argument(
@@ -944,8 +1049,8 @@ Components:
     for name in component_names:
         bench_fn = COMPONENTS[name]
 
-        # Components that may OOM: full_dit, full_inference, full_inference_offload
-        if name in ("full_dit", "full_inference", "full_inference_offload"):
+        if name in ("full_dit", "full_inference", "full_inference_offload",
+                    "full_inference_staged"):
             result = run_with_oom_fallback(
                 bench_fn, name,
                 batch_size=args.batch_size,

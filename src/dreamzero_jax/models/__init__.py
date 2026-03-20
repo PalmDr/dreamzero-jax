@@ -29,6 +29,7 @@ from dreamzero_jax.models.dreamzero import (
     InferenceOutput,
     TrainOutput,
 )
+from dreamzero_jax.models.staged_inference import generate_staged
 
 __all__ = [
     "MLPProj",
@@ -53,4 +54,5 @@ __all__ = [
     "DreamZeroConfig",
     "InferenceOutput",
     "TrainOutput",
+    "generate_staged",
 ]

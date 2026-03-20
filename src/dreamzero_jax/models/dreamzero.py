@@ -762,3 +762,15 @@ class DreamZero(nnx.Module):
             num_steps, cfg,
             key=key,
         )
+
+
+# Re-export staged inference from its own module for convenience.
+from dreamzero_jax.models.staged_inference import generate_staged  # noqa: E402
+
+__all__ = [
+    "DreamZero",
+    "DreamZeroConfig",
+    "InferenceOutput",
+    "TrainOutput",
+    "generate_staged",
+]
