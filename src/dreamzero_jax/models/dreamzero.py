@@ -400,6 +400,91 @@ class DreamZero(nnx.Module):
         f = T_lat // self.config.patch_size[0]
         return f // self.config.num_frames_per_block
 
+    def _denoise_scan(
+        self,
+        latents: jax.Array,
+        prompt_emb: jax.Array,
+        clip_emb: jax.Array | None,
+        state: jax.Array,
+        embodiment_id: jax.Array,
+        num_steps: int,
+        cfg: float,
+        *,
+        key: jax.Array,
+    ) -> InferenceOutput:
+        """Run the Euler scan denoising loop (shared by generate_scan and generate_offload)."""
+        B = latents.shape[0]
+        num_blocks = self._compute_num_blocks(latents)
+        state = self._validate_state(state, num_blocks)
+        null_prompt = jnp.zeros_like(prompt_emb)
+
+        key_vid, key_act = jax.random.split(key)
+        noisy_video = jax.random.normal(key_vid, latents.shape)
+        total_actions = (
+            num_blocks
+            * (self.config.action_horizon or self.config.num_action_per_block)
+        )
+        noisy_actions = jax.random.normal(
+            key_act, (B, total_actions, self.config.action_dim),
+        )
+
+        sched_video = make_flow_euler_schedule(
+            num_inference_steps=num_steps,
+            num_train_timesteps=self.config.num_train_timesteps,
+            shift=self.config.scheduler_shift,
+        )
+        sched_action = make_flow_euler_schedule(
+            num_inference_steps=num_steps,
+            num_train_timesteps=self.config.num_train_timesteps,
+            shift=self.config.scheduler_shift,
+        )
+
+        scan_xs = (
+            sched_video.timesteps,
+            sched_action.timesteps,
+            sched_video.sigmas,
+            sched_video.sigmas_next,
+            sched_action.sigmas,
+            sched_action.sigmas_next,
+        )
+
+        def _scan_step(carry, xs):
+            noisy_vid, noisy_act = carry
+            (t_vid_scalar, t_act_scalar,
+             sigma_vid, sigma_vid_next,
+             sigma_act, sigma_act_next) = xs
+
+            t_video = jnp.broadcast_to(t_vid_scalar, (B,))
+            t_act = jnp.broadcast_to(t_act_scalar, (B,))
+
+            vid_cond, act_cond = self.dit(
+                noisy_vid, t_video, prompt_emb,
+                state, embodiment_id, noisy_act,
+                timestep_action=t_act,
+                clip_emb=clip_emb,
+            )
+
+            vid_uncond, act_uncond = self.dit(
+                noisy_vid, t_video, null_prompt,
+                state, embodiment_id, noisy_act,
+                timestep_action=t_act,
+                clip_emb=clip_emb,
+            )
+
+            vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
+            noisy_vid_next = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
+            noisy_act_next = euler_step(act_cond, noisy_act, sigma_act, sigma_act_next)
+
+            return (noisy_vid_next, noisy_act_next), None
+
+        (final_video, final_actions), _ = jax.lax.scan(
+            _scan_step,
+            (noisy_video, noisy_actions),
+            scan_xs,
+        )
+
+        return InferenceOutput(action_pred=final_actions, video_pred=final_video)
+
     def _validate_state(
         self, state: jax.Array, num_blocks: int
     ) -> jax.Array:
@@ -579,97 +664,101 @@ class DreamZero(nnx.Module):
         """
         num_steps = num_inference_steps or self.config.num_inference_steps
         cfg = cfg_scale or self.config.cfg_scale
-        B = video.shape[0]
 
-        # --- Encode conditioning ---
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0]) if self.config.has_image_input else None
 
-        # --- Validate state against actual latent temporal dim ---
-        num_blocks = self._compute_num_blocks(latents)
-        state = self._validate_state(state, num_blocks)
-
-        # Null prompt for unconditional branch (zeros)
-        null_prompt = jnp.zeros_like(prompt_emb)
-
-        # --- Initialize noise ---
-        key_vid, key_act = jax.random.split(key)
-        noisy_video = jax.random.normal(key_vid, latents.shape)
-
-        total_actions = (
-            num_blocks
-            * (self.config.action_horizon or self.config.num_action_per_block)
-        )
-        noisy_actions = jax.random.normal(
-            key_act, (B, total_actions, self.config.action_dim),
+        return self._denoise_scan(
+            latents, prompt_emb, clip_emb,
+            state, embodiment_id,
+            num_steps, cfg,
+            key=key,
         )
 
-        # --- Build scan-compatible Euler schedule ---
-        sched_video = make_flow_euler_schedule(
-            num_inference_steps=num_steps,
-            num_train_timesteps=self.config.num_train_timesteps,
-            shift=self.config.scheduler_shift,
+    # -----------------------------------------------------------------
+    # Inference with encoder offloading
+    # -----------------------------------------------------------------
+
+    def _encode_conditioning(
+        self,
+        video: jax.Array,
+        token_ids: jax.Array,
+        attention_mask: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        """Run all encoder forward passes and return cached embeddings."""
+        prompt_emb = self.encode_prompt(token_ids, attention_mask)
+        latents = self.encode_video(video)
+        clip_emb = (
+            self.encode_image(video[:, 0])
+            if self.config.has_image_input
+            else None
         )
-        sched_action = make_flow_euler_schedule(
-            num_inference_steps=num_steps,
-            num_train_timesteps=self.config.num_train_timesteps,
-            shift=self.config.scheduler_shift,
+        return prompt_emb, latents, clip_emb
+
+    def _offload_encoders(self) -> None:
+        """Delete encoder weights from TPU HBM after encoding is complete.
+
+        Replaces text_encoder, image_encoder, and vae with None so that
+        JAX can reclaim their device buffers. The DiT (action_head) is
+        kept — it is the only module needed during the denoising loop.
+        """
+        # nnx modules hold their params as attributes; setting to None
+        # drops the Python references so JAX can free the device buffers
+        # once any pending computations finish.
+        self.text_encoder = None  # type: ignore[assignment]
+        self.image_encoder = None  # type: ignore[assignment]
+        self.vae = None  # type: ignore[assignment]
+
+    def generate_offload(
+        self,
+        video: jax.Array,
+        token_ids: jax.Array,
+        state: jax.Array,
+        embodiment_id: jax.Array,
+        attention_mask: jax.Array | None = None,
+        num_inference_steps: int | None = None,
+        cfg_scale: float | None = None,
+        *,
+        key: jax.Array,
+    ) -> InferenceOutput:
+        """Generate with encoder offloading to reduce peak HBM.
+
+        Identical to :meth:`generate_scan` except that after the encoding
+        phase, all encoder weights (text_encoder, image_encoder, vae) are
+        deleted from TPU memory. This frees ~1.6 GB/chip on v5e-8, enough
+        headroom for the DiT denoising loop activations.
+
+        WARNING: This method is destructive — after calling it the model's
+        encoders are gone. Re-initialize or re-load weights before calling
+        any encode method again.
+
+        Args:
+            video: Conditioning video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
+            token_ids: Text token IDs ``(B, L)`` int32.
+            state: Robot state ``(B, num_blocks, state_dim)``.
+            embodiment_id: ``(B,)`` int embodiment IDs.
+            attention_mask: ``(B, L)`` text attention mask.
+            num_inference_steps: Override number of denoising steps.
+            cfg_scale: Override classifier-free guidance scale.
+            key: PRNG key for noise initialization.
+
+        Returns:
+            :class:`InferenceOutput` with ``action_pred`` and ``video_pred``.
+        """
+        num_steps = num_inference_steps or self.config.num_inference_steps
+        cfg = cfg_scale or self.config.cfg_scale
+
+        prompt_emb, latents, clip_emb = self._encode_conditioning(
+            video, token_ids, attention_mask,
         )
 
-        # Pre-stack scan inputs: (num_steps,) arrays
-        scan_xs = (
-            sched_video.timesteps,       # (num_steps,) video timesteps
-            sched_action.timesteps,      # (num_steps,) action timesteps
-            sched_video.sigmas,          # (num_steps,) video sigma
-            sched_video.sigmas_next,     # (num_steps,) video sigma_next
-            sched_action.sigmas,         # (num_steps,) action sigma
-            sched_action.sigmas_next,    # (num_steps,) action sigma_next
+        jax.block_until_ready((prompt_emb, latents, clip_emb))
+        self._offload_encoders()
+
+        return self._denoise_scan(
+            latents, prompt_emb, clip_emb,
+            state, embodiment_id,
+            num_steps, cfg,
+            key=key,
         )
-
-        # --- Scan body ---
-        def _scan_step(carry, xs):
-            noisy_vid, noisy_act = carry
-            (t_vid_scalar, t_act_scalar,
-             sigma_vid, sigma_vid_next,
-             sigma_act, sigma_act_next) = xs
-
-            # Broadcast scalar timestep to batch
-            t_video = jnp.broadcast_to(t_vid_scalar, (B,))
-            t_act = jnp.broadcast_to(t_act_scalar, (B,))
-
-            # Conditional prediction
-            vid_cond, act_cond = self.dit(
-                noisy_vid, t_video, prompt_emb,
-                state, embodiment_id, noisy_act,
-                timestep_action=t_act,
-                clip_emb=clip_emb,
-            )
-
-            # Unconditional prediction (null text)
-            vid_uncond, act_uncond = self.dit(
-                noisy_vid, t_video, null_prompt,
-                state, embodiment_id, noisy_act,
-                timestep_action=t_act,
-                clip_emb=clip_emb,
-            )
-
-            # Classifier-free guidance (video only, matching generate())
-            vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
-
-            # Euler step for video
-            noisy_vid_next = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
-
-            # Euler step for actions (no CFG, matching generate())
-            noisy_act_next = euler_step(act_cond, noisy_act, sigma_act, sigma_act_next)
-
-            return (noisy_vid_next, noisy_act_next), None
-
-        # --- Run scan ---
-        (final_video, final_actions), _ = jax.lax.scan(
-            _scan_step,
-            (noisy_video, noisy_actions),
-            scan_xs,
-        )
-
-        return InferenceOutput(action_pred=final_actions, video_pred=final_video)

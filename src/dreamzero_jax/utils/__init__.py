@@ -20,6 +20,11 @@ from dreamzero_jax.utils.validation import (
     save_fixture,
     save_manifest,
 )
+from dreamzero_jax.utils.quantize import (
+    QuantizedLinear,
+    estimate_memory_savings,
+    quantize_model,
+)
 from dreamzero_jax.utils.sharding import (
     AXIS_NAMES,
     DATA_AXIS,
@@ -72,4 +77,7 @@ __all__ = [
     "shard_batch",
     "shard_params",
     "with_sharding_constraint",
+    "QuantizedLinear",
+    "estimate_memory_savings",
+    "quantize_model",
 ]

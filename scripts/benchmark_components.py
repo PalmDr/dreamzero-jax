@@ -50,6 +50,7 @@ from dreamzero_jax.models.vae import WanVideoVAE
 from dreamzero_jax.models.action_head import CausalWanDiT
 from dreamzero_jax.models.dreamzero import DreamZero, DreamZeroConfig
 from dreamzero_jax.utils.sharding import create_mesh, shard_params, REPLICATED
+from dreamzero_jax.utils.quantize import quantize_model, estimate_memory_savings
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -192,6 +193,7 @@ def bench_single_block(
     iters: int = 10,
     use_pallas: bool = False,
     mesh: Mesh | None = None,
+    quantize_int8: bool = False,
 ) -> BenchmarkResult:
     """Benchmark a single WanDiTBlock at 14B config."""
     dtype = resolve_dtype(dtype_str)
@@ -199,7 +201,8 @@ def bench_single_block(
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
 
     pallas_str = " [Pallas]" if use_pallas else ""
-    print(f"  Initializing single WanDiTBlock (d={dim}, heads=40, ffn=13824){pallas_str}...")
+    q_str = " [INT8]" if quantize_int8 else ""
+    print(f"  Initializing single WanDiTBlock (d={dim}, heads=40, ffn=13824){pallas_str}{q_str}...")
     block = WanDiTBlock(
         dim=dim,
         num_heads=CONFIG_14B["num_heads"],
@@ -211,6 +214,10 @@ def bench_single_block(
         param_dtype=dtype,
         rngs=rngs,
     )
+
+    if quantize_int8:
+        print("  Applying INT8 weight quantization...")
+        block = quantize_model(block)
 
     # Shard model weights across devices if mesh is provided
     if mesh is not None:
@@ -260,6 +267,7 @@ def bench_full_dit(
     use_remat: bool = False,
     mesh: Mesh | None = None,
     scan_loop: bool = False,  # unused, kept for API consistency with run_with_oom_fallback
+    quantize_int8: bool = False,
 ) -> BenchmarkResult:
     """Benchmark the full WanDiT backbone."""
     dtype = resolve_dtype(dtype_str)
@@ -270,6 +278,7 @@ def bench_full_dit(
     if use_pallas: flags.append("Pallas")
     if use_scan: flags.append("Scan")
     if use_remat: flags.append("Remat")
+    if quantize_int8: flags.append("INT8")
     flag_str = f" [{', '.join(flags)}]" if flags else ""
     # Initialise on CPU when sharding is enabled to avoid OOM on TPU chip 0.
     # The full 14B model weights (~30 GB bf16) exceed single-chip HBM.
@@ -307,6 +316,14 @@ def bench_full_dit(
             )
         raise
 
+    if quantize_int8:
+        print("  Applying INT8 weight quantization...")
+        savings = estimate_memory_savings(model)
+        model = quantize_model(model)
+        print(f"  Weight memory: {savings['original_bytes'] / 1e9:.2f} GB -> "
+              f"{savings['quantized_bytes'] / 1e9:.2f} GB "
+              f"({savings['savings_pct']:.0f}% reduction)")
+
     # Shard model weights across devices if mesh is provided
     if mesh is not None:
         print("  Sharding model weights across devices...")
@@ -332,11 +349,12 @@ def bench_full_dit(
     def run(model, x, timestep, context, clip_emb):
         return model(x, timestep, context, clip_emb=clip_emb)
 
+    q_tag = " INT8" if quantize_int8 else ""
     print(f"  Running benchmark ({warmup} warmup + {iters} timed)...")
     return benchmark_fn(
         run, model, x, timestep, context, clip_emb,
         warmup=warmup, iters=iters,
-        name=f"Full DiT ({num_layers} layers)",
+        name=f"Full DiT ({num_layers} layers{q_tag})",
     )
 
 
@@ -445,6 +463,7 @@ def bench_full_inference(
     use_remat: bool = False,
     mesh: Mesh | None = None,
     scan_loop: bool = False,
+    quantize_int8: bool = False,
 ) -> BenchmarkResult:
     """Benchmark full DreamZero.generate (16 steps, CFG).
 
@@ -544,6 +563,114 @@ def bench_full_inference(
     )
 
 
+def bench_full_inference_offload(
+    batch_size: int = 1,
+    num_layers: int = 40,
+    dtype_str: str = "bf16",
+    warmup: int = 3,
+    iters: int = 10,
+    use_pallas: bool = False,
+    use_scan: bool = False,
+    use_remat: bool = False,
+    mesh: Mesh | None = None,
+    scan_loop: bool = False,  # unused, kept for API consistency
+) -> BenchmarkResult:
+    """Benchmark DreamZero.generate_offload (encoder offloading).
+
+    Encodes text/image/VAE first, deletes encoder weights to free ~1.6 GB/chip,
+    then runs the DiT denoising loop. Because generate_offload is destructive
+    (it deletes encoder weights), we re-create the model each iteration.
+    """
+    dtype = resolve_dtype(dtype_str)
+
+    config = DreamZeroConfig(
+        dim=CONFIG_14B["dim"],
+        ffn_dim=CONFIG_14B["ffn_dim"],
+        num_heads=CONFIG_14B["num_heads"],
+        num_layers=num_layers,
+        freq_dim=CONFIG_14B["freq_dim"],
+        text_dim=CONFIG_14B["text_dim"],
+        patch_size=CONFIG_14B["patch_size"],
+        in_channels=CONFIG_14B["in_channels"],
+        out_channels=CONFIG_14B["out_channels"],
+        has_image_input=True,
+        num_inference_steps=16,
+        cfg_scale=5.0,
+        use_scan=use_scan,
+        use_remat=use_remat,
+        dtype=dtype,
+        param_dtype=dtype,
+    )
+
+    init_device = jax.devices("cpu")[0] if mesh is not None else None
+    init_ctx = jax.default_device(init_device) if init_device else contextlib.nullcontext()
+
+    # Prepare inputs once (they are reusable across iterations)
+    key = jax.random.PRNGKey(42)
+    k1, k2 = jax.random.split(key)
+    video = jax.random.normal(k1, (batch_size, VIDEO_FRAMES, VIDEO_H, VIDEO_W, 3), dtype=dtype)
+    token_ids = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
+    attention_mask = jnp.ones((batch_size, TEXT_SEQ_LEN), dtype=jnp.int32)
+    num_blocks = LATENT_T // config.num_frames_per_block
+    state = jax.random.normal(k2, (batch_size, num_blocks, config.state_dim), dtype=jnp.float32)
+    embodiment_id = jnp.zeros((batch_size,), dtype=jnp.int32)
+    gen_key = jax.random.PRNGKey(99)
+
+    if mesh is not None:
+        replicated = NamedSharding(mesh, P())
+        video = jax.device_put(video, replicated)
+        token_ids = jax.device_put(token_ids, replicated)
+        attention_mask = jax.device_put(attention_mask, replicated)
+        state = jax.device_put(state, replicated)
+        embodiment_id = jax.device_put(embodiment_id, replicated)
+        gen_key = jax.device_put(gen_key, replicated)
+
+    def _create_and_run():
+        """Create model, run offloaded inference, return result."""
+        rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
+        with init_ctx:
+            model = DreamZero(config, rngs=rngs)
+        if mesh is not None:
+            model = shard_params(model, mesh, param_dtype=dtype)
+        result = model.generate_offload(
+            video, token_ids, state, embodiment_id,
+            attention_mask=attention_mask,
+            key=gen_key,
+        )
+        jax.block_until_ready(result)
+        return result
+
+    print(f"  Initializing DreamZero + offload benchmark ({num_layers}L)"
+          f"{' [CPU init]' if init_device else ''}...")
+    print(f"  Note: model is re-created each iteration (offload is destructive)")
+    print(f"  Running offload benchmark ({warmup} warmup + {iters} timed)...")
+
+    # Warmup
+    for _ in range(warmup):
+        _create_and_run()
+
+    reset_hbm_peak()
+
+    timings = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _create_and_run()
+        t1 = time.perf_counter()
+        timings.append((t1 - t0) * 1000.0)
+
+    hbm_gb = get_hbm_usage_gb()
+    arr = np.array(timings)
+
+    return BenchmarkResult(
+        name=f"Full inference offload ({num_layers}L, 16 steps, scan)",
+        mean_ms=float(np.mean(arr)),
+        std_ms=float(np.std(arr)),
+        min_ms=float(np.min(arr)),
+        max_ms=float(np.max(arr)),
+        hbm_gb=hbm_gb,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Component registry
 # ---------------------------------------------------------------------------
@@ -554,6 +681,7 @@ COMPONENTS = {
     "vae_encode": bench_vae_encode,
     "vae_decode": bench_vae_decode,
     "full_inference": bench_full_inference,
+    "full_inference_offload": bench_full_inference_offload,
 }
 
 
@@ -669,17 +797,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Components:
-  single_block   Single WanDiTBlock (d=5120, heads=40, ffn=13824)
-  full_dit       Full WanDiT backbone (40 layers by default)
-  vae_encode     VAE encode: 33 frames @ 320x176
-  vae_decode     VAE decode: latents -> 33 frames
-  full_inference Full DreamZero.generate (16 steps, CFG)
-  all            Run all of the above
+  single_block            Single WanDiTBlock (d=5120, heads=40, ffn=13824)
+  full_dit                Full WanDiT backbone (40 layers by default)
+  vae_encode              VAE encode: 33 frames @ 320x176
+  vae_decode              VAE decode: latents -> 33 frames
+  full_inference          Full DreamZero.generate (16 steps, CFG)
+  full_inference_offload  Full inference with encoder offloading (frees ~1.6 GB/chip)
+  all                     Run all of the above
 """,
     )
     parser.add_argument(
         "--component", type=str, default="all",
-        choices=["single_block", "full_dit", "vae_encode", "vae_decode", "full_inference", "all"],
+        choices=["single_block", "full_dit", "vae_encode", "vae_decode",
+                 "full_inference", "full_inference_offload", "all"],
         help="Which component to benchmark (default: all)",
     )
     parser.add_argument(
@@ -728,7 +858,16 @@ Components:
         "--shard", action="store_true",
         help="Enable tensor parallelism: shard model weights across all TPU chips",
     )
+    parser.add_argument(
+        "--offload-encoders", action="store_true",
+        help="When running full_inference, use generate_offload() to delete encoder "
+             "weights after encoding, freeing ~1.6 GB/chip for DiT activations.",
+    )
     args = parser.parse_args()
+
+    # --offload-encoders remaps full_inference -> full_inference_offload
+    if args.offload_encoders and args.component == "full_inference":
+        args.component = "full_inference_offload"
 
     # --- Device info ---
     devices = jax.devices()
@@ -760,6 +899,8 @@ Components:
         print("Activation checkpointing: ENABLED (jax.checkpoint/remat per DiT block)")
     if args.scan_loop:
         print("Scan denoising loop: ENABLED (generate_scan with Euler + jax.lax.scan)")
+    if args.offload_encoders:
+        print("Encoder offloading: ENABLED (delete text/image/VAE weights after encoding)")
 
     # --- Tensor parallelism mesh ---
     mesh = None
@@ -781,8 +922,8 @@ Components:
     for name in component_names:
         bench_fn = COMPONENTS[name]
 
-        # Components that may OOM: full_dit, full_inference
-        if name in ("full_dit", "full_inference"):
+        # Components that may OOM: full_dit, full_inference, full_inference_offload
+        if name in ("full_dit", "full_inference", "full_inference_offload"):
             result = run_with_oom_fallback(
                 bench_fn, name,
                 batch_size=args.batch_size,

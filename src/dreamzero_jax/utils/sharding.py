@@ -163,6 +163,25 @@ _SHARD_OUTPUT_PATTERNS = (
     r"\.w_gate\.kernel$",
     r"\.linear1\.kernel$",     # MLPProj, MLP in time_embedding/text_embedding
     r"\.time_projection\.kernel$",
+    # INT8 quantized equivalents (QuantizedLinear stores kernel_i8 + scales)
+    r"\.q_proj\.kernel_i8$",
+    r"\.k_proj\.kernel_i8$",
+    r"\.v_proj\.kernel_i8$",
+    r"\.k_img\.kernel_i8$",
+    r"\.v_img\.kernel_i8$",
+    r"\.w_up\.kernel_i8$",
+    r"\.w_gate\.kernel_i8$",
+    r"\.linear1\.kernel_i8$",
+    r"\.time_projection\.kernel_i8$",
+    r"\.q_proj\.scales$",
+    r"\.k_proj\.scales$",
+    r"\.v_proj\.scales$",
+    r"\.k_img\.scales$",
+    r"\.v_img\.scales$",
+    r"\.w_up\.scales$",
+    r"\.w_gate\.scales$",
+    r"\.linear1\.scales$",
+    r"\.time_projection\.scales$",
 )
 
 # Patterns that indicate a parameter should be sharded on its input (first) dim.
@@ -171,6 +190,10 @@ _SHARD_INPUT_PATTERNS = (
     r"\.out_proj\.kernel$",
     r"\.w_down\.kernel$",
     r"\.linear2\.kernel$",     # MLPProj
+    # INT8 quantized equivalents
+    r"\.out_proj\.kernel_i8$",
+    r"\.w_down\.kernel_i8$",
+    r"\.linear2\.kernel_i8$",
 )
 
 # Patterns that should always be replicated regardless of shape.
