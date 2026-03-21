@@ -369,8 +369,11 @@ def _add_dit_block_rules(
     """Add rules for a WanDiTBlock (DROID naming convention)."""
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.modulation$",
-        f"{flax_prefix}.modulation.value",
+        f"{flax_prefix}.modulation",
     )
+
+    # norm3: cross-attention pre-norm (LayerNorm with scale + bias)
+    _add_layernorm_rules(builder, f"{pt_prefix}.norm3", f"{flax_prefix}.norm3")
 
     sa_pt = f"{pt_prefix}.self_attn"
     sa_fl = f"{flax_prefix}.self_attn"
@@ -416,7 +419,7 @@ def _add_dit_head_rules(
     """Add rules for WanDiTHead (DROID: head.head -> Flax: head.linear)."""
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.modulation$",
-        f"{flax_prefix}.modulation.value",
+        f"{flax_prefix}.modulation",
     )
     _add_linear_rules(builder, f"{pt_prefix}.head", f"{flax_prefix}.linear")
     _add_linear_rules(builder, f"{pt_prefix}.linear", f"{flax_prefix}.linear")
@@ -439,22 +442,22 @@ def _add_category_specific_linear_rules(
     pt_prefix: str,
     flax_prefix: str,
 ) -> None:
-    """Map CategorySpecificLinear: PT W/b -> Flax weight.value/bias.value."""
+    """Map CategorySpecificLinear: PT W/b -> Flax weight/bias."""
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.W$",
-        f"{flax_prefix}.weight.value",
+        f"{flax_prefix}.weight",
     )
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.weight$",
-        f"{flax_prefix}.weight.value",
+        f"{flax_prefix}.weight",
     )
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.b$",
-        f"{flax_prefix}.bias.value",
+        f"{flax_prefix}.bias",
     )
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.bias$",
-        f"{flax_prefix}.bias.value",
+        f"{flax_prefix}.bias",
     )
 
 
@@ -675,28 +678,32 @@ def _add_droid_vae_decoder_rules(
             f"{flax_prefix}.stages.{stage}.blocks.{block}",
         )
 
+    # Stages 0,1: temporal (index 0) + spatial (index 1).
+    # TemporalUpsample wraps CausalConv3d -> .conv.conv is the nnx.Conv.
+    # SpatialUpsample has .conv directly as nnx.Conv.
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.3.resample.1",
+        f"{pt_prefix}.upsamples.3.time_conv",
         f"{flax_prefix}.stages.0.resample.0.conv.conv",
     )
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.3.time_conv",
+        f"{pt_prefix}.upsamples.3.resample.1",
         f"{flax_prefix}.stages.0.resample.1.conv",
     )
 
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.resample.1",
+        f"{pt_prefix}.upsamples.7.time_conv",
         f"{flax_prefix}.stages.1.resample.0.conv.conv",
     )
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.time_conv",
+        f"{pt_prefix}.upsamples.7.resample.1",
         f"{flax_prefix}.stages.1.resample.1.conv",
     )
 
+    # Stage 2: spatial only (index 0), no temporal.
     _add_conv_rules(
         builder,
         f"{pt_prefix}.upsamples.11.resample.1",
@@ -847,22 +854,22 @@ def build_key_mapping(config: Any) -> KeyMappingBuilder:
 
     b.add_rule(
         rf"^{re.escape(ie_pt)}\.cls_embedding$",
-        f"{ie_fl}.cls_embedding.value",
+        f"{ie_fl}.cls_embedding",
     )
     b.add_rule(
         rf"^{re.escape(ie_pt)}\.pos_embedding$",
-        f"{ie_fl}.pos_embedding.value",
+        f"{ie_fl}.pos_embedding",
     )
     _add_layernorm_rules(b, f"{ie_pt}.pre_norm", f"{ie_fl}.pre_norm")
     _add_layernorm_rules(b, f"{ie_pt}.post_norm", f"{ie_fl}.post_norm_layer")
     b.add_rule(
         rf"^{re.escape(ie_pt)}\.head$",
-        f"{ie_fl}.head.value",
+        f"{ie_fl}.head",
     )
 
     b.add_rule(
         rf"^image_encoder\.model\.log_scale$",
-        "image_encoder.log_scale.value",
+        "image_encoder.log_scale",
     )
 
     image_num_layers = getattr(config, "image_num_layers", 32)

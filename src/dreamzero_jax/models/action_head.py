@@ -297,7 +297,7 @@ class CausalWanDiT(nnx.Module):
         patch_size: tuple[int, int, int] = (1, 2, 2),
         has_image_input: bool = False,
         qk_norm: bool = True,
-        cross_attn_norm: bool = False,
+        cross_attn_norm: bool = True,
         eps: float = 1e-6,
         use_scan: bool = False,
         use_remat: bool = False,

@@ -285,14 +285,17 @@ class SpatialUpsample(nnx.Module):
     def __init__(
         self,
         dim: int,
+        out_dim: int | None = None,
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
+        if out_dim is None:
+            out_dim = dim
         self.conv = nnx.Conv(
             in_features=dim,
-            out_features=dim,
+            out_features=out_dim,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding="SAME",
@@ -308,14 +311,14 @@ class SpatialUpsample(nnx.Module):
             x: ``(B, T, H, W, C)``
 
         Returns:
-            ``(B, T, 2*H, 2*W, C)``
+            ``(B, T, 2*H, 2*W, C_out)``
         """
         B, T, H, W, C = x.shape
         x = x.reshape(B * T, H, W, C)
         x = jax.image.resize(x, (B * T, H * 2, W * 2, C), method="nearest")
         x = self.conv(x)
-        _, H2, W2, _ = x.shape
-        return x.reshape(B, T, H2, W2, C)
+        _, H2, W2, C_out = x.shape
+        return x.reshape(B, T, H2, W2, C_out)
 
 
 class TemporalUpsample(nnx.Module):
@@ -491,27 +494,35 @@ class Decoder3d(nnx.Module):
         rev_temporal = list(reversed(temporal_upsample))
         num_dec_blocks = num_res_blocks + 1
 
+        # WAN VAE spatial resamples halve channels. Track the actual channel
+        # entering each stage (= previous stage's spatial resample output).
         self.stages = nnx.List([])
+        stage_in_ch = rev_dims[0]  # first stage fed by mid block
         for i in range(len(rev_dims)):
-            in_ch = rev_dims[i - 1] if i > 0 else rev_dims[0]
             out_ch = rev_dims[i]
 
             blocks = []
             for j in range(num_dec_blocks):
                 blocks.append(ResidualBlock(
-                    in_ch if j == 0 else out_ch, out_ch, **kw,
+                    stage_in_ch if j == 0 else out_ch, out_ch, **kw,
                 ))
             stage = nnx.Dict({
                 "blocks": nnx.List(blocks),
             })
 
-            # Upsample (all stages except the last)
+            # Upsample (all stages except the last).
+            # Spatial resample outputs half the current channel count,
+            # matching the WAN VideoVAE convention.
             if i < len(rev_dims) - 1:
+                spatial_out = out_ch // 2
                 resample_layers = nnx.List([])
                 if rev_temporal[i]:
                     resample_layers.append(TemporalUpsample(out_ch, **kw))
-                resample_layers.append(SpatialUpsample(out_ch, **kw))
+                resample_layers.append(
+                    SpatialUpsample(out_ch, spatial_out, **kw),
+                )
                 stage["resample"] = resample_layers
+                stage_in_ch = spatial_out
             else:
                 stage["resample"] = nnx.List([])
 
