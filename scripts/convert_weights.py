@@ -288,9 +288,10 @@ def _convert_and_save(pt_state, config, args):
     import jax
     from flax import nnx
 
-    print("\nInstantiating model...")
+    print("\nInstantiating model on CPU...")
     t0 = time.monotonic()
-    model = DreamZero(config, rngs=nnx.Rngs(0))
+    with jax.default_device(jax.devices("cpu")[0]):
+        model = DreamZero(config, rngs=nnx.Rngs(0))
     print(f"  Done ({time.monotonic() - t0:.1f}s)")
 
     model_params = sum(v.size for v in jax.tree.leaves(nnx.state(model)))

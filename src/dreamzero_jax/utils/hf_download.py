@@ -109,11 +109,21 @@ def load_single_safetensors(path: Path) -> dict[str, np.ndarray]:
 
 
 def load_checkpoint_auto(path: Path) -> dict[str, np.ndarray]:
-    """Load a checkpoint, handling sharded safetensors and regular files.
-
-    Dispatches to the appropriate loader based on file extension.
-    """
+    """Load a checkpoint, handling directories, sharded safetensors, and files."""
     from dreamzero_jax.utils.checkpoint import load_pytorch_checkpoint
+
+    path = Path(path)
+    if path.is_dir():
+        index = path / "model.safetensors.index.json"
+        if index.exists():
+            return load_sharded_safetensors(index)
+        single = path / "model.safetensors"
+        if single.exists():
+            return dict(load_single_safetensors(single))
+        found = find_checkpoint_file(path)
+        if found:
+            return load_checkpoint_auto(found)
+        raise FileNotFoundError(f"No checkpoint found in {path}")
 
     if path.name.endswith(".index.json") or (
         path.suffix == ".json" and "safetensors" in path.name

@@ -78,6 +78,41 @@ def _transpose_conv_auto(x: np.ndarray) -> np.ndarray:
         raise ValueError(f"Cannot auto-detect conv transpose for shape {x.shape}")
 
 
+def _squeeze(x: np.ndarray) -> np.ndarray:
+    """Squeeze trailing singleton dimensions (e.g. (384, 1, 1) -> (384,))."""
+    return x.squeeze()
+
+
+def _make_qkv_chunk(idx: int) -> Callable[[np.ndarray], np.ndarray]:
+    """Return a transform that extracts chunk idx (0=q, 1=k, 2=v) from fused QKV.
+
+    Works for both 1x1 Conv (out, in, 1, 1) and Dense (out, in) fused weights.
+    Output is transposed to Flax (in, out) convention.
+    """
+    def _extract(x: np.ndarray) -> np.ndarray:
+        if x.ndim == 4:
+            x = x.squeeze(axis=(2, 3))
+        chunk_size = x.shape[0] // 3
+        chunk = x[idx * chunk_size : (idx + 1) * chunk_size]
+        return chunk.T
+    return _extract
+
+
+def _make_qkv_bias_chunk(idx: int) -> Callable[[np.ndarray], np.ndarray]:
+    """Extract chunk idx from fused QKV bias."""
+    def _extract(x: np.ndarray) -> np.ndarray:
+        chunk_size = x.shape[0] // 3
+        return x[idx * chunk_size : (idx + 1) * chunk_size]
+    return _extract
+
+
+def _conv1x1_to_dense(x: np.ndarray) -> np.ndarray:
+    """Conv 1x1 weight (out, in, 1, 1) -> Dense kernel (in, out)."""
+    if x.ndim == 4:
+        x = x.squeeze(axis=(2, 3))
+    return x.T
+
+
 # ---------------------------------------------------------------------------
 # Loading PyTorch checkpoints
 # ---------------------------------------------------------------------------
@@ -302,30 +337,26 @@ def _add_mlp_rules(
     flax_prefix: str,
     use_bias: bool = True,
 ) -> None:
-    """Add rules for a 2-layer MLP.
-
-    PyTorch nn.Sequential convention: {prefix}.0.weight / {prefix}.2.weight
-    Flax MLP: {prefix}.w_up.kernel / {prefix}.w_down.kernel
-    """
-    # Sequential(Linear, act, Linear) -> MLP(w_up, w_down)
+    """Add rules for a 2-layer MLP (Sequential: Linear, act, Linear)."""
     _add_linear_rules(builder, f"{pt_prefix}.0", f"{flax_prefix}.w_up", use_bias)
     _add_linear_rules(builder, f"{pt_prefix}.2", f"{flax_prefix}.w_down", use_bias)
-
-
-def _add_mlp_direct_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-    use_bias: bool = True,
-) -> None:
-    """Add rules for MLP when PyTorch uses named attributes (linear1/linear2)."""
-    _add_linear_rules(builder, f"{pt_prefix}.linear1", f"{flax_prefix}.w_up", use_bias)
-    _add_linear_rules(builder, f"{pt_prefix}.linear2", f"{flax_prefix}.w_down", use_bias)
 
 
 # ---------------------------------------------------------------------------
 # Component-level mapping builders
 # ---------------------------------------------------------------------------
+
+
+def _add_droid_attn_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+    projs: tuple[str, ...] = ("q", "k", "v", "o"),
+    flax_projs: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "out_proj"),
+) -> None:
+    """Map DROID-style attn (q/k/v/o) to Flax (q_proj/k_proj/v_proj/out_proj)."""
+    for pt_name, fl_name in zip(projs, flax_projs):
+        _add_linear_rules(builder, f"{pt_prefix}.{pt_name}", f"{flax_prefix}.{fl_name}")
 
 
 def _add_dit_block_rules(
@@ -334,40 +365,25 @@ def _add_dit_block_rules(
     flax_prefix: str,
     has_image_input: bool = False,
     qk_norm: bool = True,
-    cross_attn_norm: bool = False,
 ) -> None:
-    """Add rules for a WanDiTBlock."""
-    # Norms (no scale/bias -- elementwise_affine=False in PyTorch)
-    # PyTorch LayerNorm with elementwise_affine=False has no weight/bias
-    # so no rules needed for norm1, norm2
-
-    # Modulation: direct copy of the learnable bias
+    """Add rules for a WanDiTBlock (DROID naming convention)."""
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.modulation$",
         f"{flax_prefix}.modulation.value",
     )
 
-    # Self-attention
     sa_pt = f"{pt_prefix}.self_attn"
     sa_fl = f"{flax_prefix}.self_attn"
-    _add_linear_rules(builder, f"{sa_pt}.q_proj", f"{sa_fl}.q_proj")
-    _add_linear_rules(builder, f"{sa_pt}.k_proj", f"{sa_fl}.k_proj")
-    _add_linear_rules(builder, f"{sa_pt}.v_proj", f"{sa_fl}.v_proj")
-    _add_linear_rules(builder, f"{sa_pt}.out_proj", f"{sa_fl}.out_proj")
+    _add_droid_attn_rules(builder, sa_pt, sa_fl)
     if qk_norm:
         _add_layernorm_rules(builder, f"{sa_pt}.norm_q", f"{sa_fl}.norm_q", has_bias=False)
         _add_layernorm_rules(builder, f"{sa_pt}.norm_k", f"{sa_fl}.norm_k", has_bias=False)
 
-    # Cross-attention
     ca_pt = f"{pt_prefix}.cross_attn"
     ca_fl = f"{flax_prefix}.cross_attn"
-    _add_linear_rules(builder, f"{ca_pt}.q_proj", f"{ca_fl}.q_proj")
-    _add_linear_rules(builder, f"{ca_pt}.k_proj", f"{ca_fl}.k_proj")
-    _add_linear_rules(builder, f"{ca_pt}.v_proj", f"{ca_fl}.v_proj")
-    _add_linear_rules(builder, f"{ca_pt}.out_proj", f"{ca_fl}.out_proj")
+    _add_droid_attn_rules(builder, ca_pt, ca_fl)
 
     if has_image_input:
-        # WanI2VCrossAttention has separate image K/V
         _add_linear_rules(builder, f"{ca_pt}.k_img", f"{ca_fl}.k_img")
         _add_linear_rules(builder, f"{ca_pt}.v_img", f"{ca_fl}.v_img")
         if qk_norm:
@@ -375,7 +391,7 @@ def _add_dit_block_rules(
                 builder, f"{ca_pt}.norm_q", f"{ca_fl}.norm_q", has_bias=False,
             )
             _add_layernorm_rules(
-                builder, f"{ca_pt}.norm_k_text", f"{ca_fl}.norm_k_text", has_bias=False,
+                builder, f"{ca_pt}.norm_k", f"{ca_fl}.norm_k_text", has_bias=False,
             )
             _add_layernorm_rules(
                 builder, f"{ca_pt}.norm_k_img", f"{ca_fl}.norm_k_img", has_bias=False,
@@ -389,11 +405,6 @@ def _add_dit_block_rules(
                 builder, f"{ca_pt}.norm_k", f"{ca_fl}.norm_k", has_bias=False,
             )
 
-    # Optional cross-attention norm
-    if cross_attn_norm:
-        _add_layernorm_rules(builder, f"{pt_prefix}.norm3", f"{flax_prefix}.norm3")
-
-    # FFN: PyTorch uses nn.Sequential(Linear, act, Linear) or named (ffn.0, ffn.2)
     _add_mlp_rules(builder, f"{pt_prefix}.ffn", f"{flax_prefix}.ffn")
 
 
@@ -402,27 +413,25 @@ def _add_dit_head_rules(
     pt_prefix: str,
     flax_prefix: str,
 ) -> None:
-    """Add rules for WanDiTHead."""
-    # LayerNorm (no scale/bias)
-    # Modulation
+    """Add rules for WanDiTHead (DROID: head.head -> Flax: head.linear)."""
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.modulation$",
         f"{flax_prefix}.modulation.value",
     )
-    # Linear
+    _add_linear_rules(builder, f"{pt_prefix}.head", f"{flax_prefix}.linear")
     _add_linear_rules(builder, f"{pt_prefix}.linear", f"{flax_prefix}.linear")
 
 
-def _add_mlp_proj_rules(
+def _add_mlp_proj_sequential_rules(
     builder: KeyMappingBuilder,
     pt_prefix: str,
     flax_prefix: str,
 ) -> None:
-    """Add rules for MLPProj (norm_in, linear1, linear2, norm_out)."""
-    _add_layernorm_rules(builder, f"{pt_prefix}.norm_in", f"{flax_prefix}.norm_in")
-    _add_linear_rules(builder, f"{pt_prefix}.linear1", f"{flax_prefix}.linear1")
-    _add_linear_rules(builder, f"{pt_prefix}.linear2", f"{flax_prefix}.linear2")
-    _add_layernorm_rules(builder, f"{pt_prefix}.norm_out", f"{flax_prefix}.norm_out")
+    """Map DROID Sequential MLPProj (proj.0/1/3/4) to Flax (norm_in/linear1/linear2/norm_out)."""
+    _add_layernorm_rules(builder, f"{pt_prefix}.0", f"{flax_prefix}.norm_in")
+    _add_linear_rules(builder, f"{pt_prefix}.1", f"{flax_prefix}.linear1")
+    _add_linear_rules(builder, f"{pt_prefix}.3", f"{flax_prefix}.linear2")
+    _add_layernorm_rules(builder, f"{pt_prefix}.4", f"{flax_prefix}.norm_out")
 
 
 def _add_category_specific_linear_rules(
@@ -430,15 +439,18 @@ def _add_category_specific_linear_rules(
     pt_prefix: str,
     flax_prefix: str,
 ) -> None:
-    """Add rules for CategorySpecificLinear.
-
-    PyTorch stores weight as (num_cats, in, out) and bias as (num_cats, out).
-    Flax stores them as nnx.Param (same shapes -- no transpose needed since
-    the forward pass uses einsum, not matmul).
-    """
+    """Map CategorySpecificLinear: PT W/b -> Flax weight.value/bias.value."""
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.W$",
+        f"{flax_prefix}.weight.value",
+    )
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.weight$",
         f"{flax_prefix}.weight.value",
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.b$",
+        f"{flax_prefix}.bias.value",
     )
     builder.add_rule(
         rf"^{re.escape(pt_prefix)}\.bias$",
@@ -451,12 +463,271 @@ def _add_category_specific_mlp_rules(
     pt_prefix: str,
     flax_prefix: str,
 ) -> None:
-    """Add rules for CategorySpecificMLP (linear1, linear2)."""
+    """Map CategorySpecificMLP with DROID naming (layer1/layer2)."""
+    _add_category_specific_linear_rules(
+        builder, f"{pt_prefix}.layer1", f"{flax_prefix}.linear1",
+    )
     _add_category_specific_linear_rules(
         builder, f"{pt_prefix}.linear1", f"{flax_prefix}.linear1",
     )
     _add_category_specific_linear_rules(
+        builder, f"{pt_prefix}.layer2", f"{flax_prefix}.linear2",
+    )
+    _add_category_specific_linear_rules(
         builder, f"{pt_prefix}.linear2", f"{flax_prefix}.linear2",
+    )
+
+
+def _add_text_encoder_gate_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+) -> None:
+    """Map DROID T5 gate (gate.0.weight for Sequential) to Flax gate.kernel."""
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.0\.weight$",
+        f"{flax_prefix}.kernel",
+        _transpose_dense,
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.weight$",
+        f"{flax_prefix}.kernel",
+        _transpose_dense,
+    )
+
+
+# ---------------------------------------------------------------------------
+# VAE helpers for DROID flat-list naming
+# ---------------------------------------------------------------------------
+
+
+def _add_droid_residual_block_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+) -> None:
+    """Map DROID VAE residual block (Sequential: gamma/conv) to Flax."""
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.residual\.0\.gamma$",
+        f"{flax_prefix}.norm1.scale",
+        _squeeze,
+    )
+    _add_conv_rules(builder, f"{pt_prefix}.residual.2", f"{flax_prefix}.conv1.conv")
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.residual\.3\.gamma$",
+        f"{flax_prefix}.norm2.scale",
+        _squeeze,
+    )
+    _add_conv_rules(builder, f"{pt_prefix}.residual.6", f"{flax_prefix}.conv2.conv")
+    _add_conv_rules(builder, f"{pt_prefix}.shortcut", f"{flax_prefix}.shortcut.conv")
+
+
+def _add_droid_attn_block_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+) -> None:
+    """Map DROID VAE attention block (norm.gamma, fused to_qkv, proj -> out_proj).
+
+    PT uses Conv1x1 for to_qkv (fused) and proj; Flax uses separate Dense layers.
+    The fused QKV is split in :func:`_split_fused_qkv_params` post-processing.
+    """
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.norm\.gamma$",
+        f"{flax_prefix}.norm.scale",
+        _squeeze,
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.to_qkv\.weight$",
+        f"{flax_prefix}.attn._fused_qkv.kernel",
+        _conv1x1_to_dense,
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.to_qkv\.bias$",
+        f"{flax_prefix}.attn._fused_qkv.bias",
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.proj\.weight$",
+        f"{flax_prefix}.attn.out_proj.kernel",
+        _conv1x1_to_dense,
+    )
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.proj\.bias$",
+        f"{flax_prefix}.attn.out_proj.bias",
+    )
+
+
+def _add_droid_vae_encoder_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+) -> None:
+    """Map DROID VAE encoder flat downsamples to Flax staged layout.
+
+    DROID flat indices for encoder (dim_mults=(1,2,4,4), num_res_blocks=2):
+      0,1  -> stage 0, blocks 0,1
+      2    -> stage 0, resample (spatial: resample.1 -> resample.0.conv)
+      3,4  -> stage 1, blocks 0,1
+      5    -> stage 1, resample (spatial .resample.1 + temporal .time_conv)
+      6,7  -> stage 2, blocks 0,1
+      8    -> stage 2, resample (spatial .resample.1 + temporal .time_conv)
+      9,10 -> stage 3, blocks 0,1
+    """
+    _add_conv_rules(builder, f"{pt_prefix}.conv1", f"{flax_prefix}.stem.conv")
+
+    enc_layout = [
+        (0, 0, 0), (1, 0, 1),
+        (3, 1, 0), (4, 1, 1),
+        (6, 2, 0), (7, 2, 1),
+        (9, 3, 0), (10, 3, 1),
+    ]
+    for flat_idx, stage, block in enc_layout:
+        _add_droid_residual_block_rules(
+            builder,
+            f"{pt_prefix}.downsamples.{flat_idx}",
+            f"{flax_prefix}.stages.{stage}.blocks.{block}",
+        )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.downsamples.2.resample.1",
+        f"{flax_prefix}.stages.0.resample.0.conv",
+    )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.downsamples.5.resample.1",
+        f"{flax_prefix}.stages.1.resample.0.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.downsamples.5.time_conv",
+        f"{flax_prefix}.stages.1.resample.1.conv.conv",
+    )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.downsamples.8.resample.1",
+        f"{flax_prefix}.stages.2.resample.0.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.downsamples.8.time_conv",
+        f"{flax_prefix}.stages.2.resample.1.conv.conv",
+    )
+
+    _add_droid_residual_block_rules(
+        builder,
+        f"{pt_prefix}.middle.0",
+        f"{flax_prefix}.mid_block1",
+    )
+    _add_droid_attn_block_rules(
+        builder,
+        f"{pt_prefix}.middle.1",
+        f"{flax_prefix}.mid_attn",
+    )
+    _add_droid_residual_block_rules(
+        builder,
+        f"{pt_prefix}.middle.2",
+        f"{flax_prefix}.mid_block2",
+    )
+
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.head\.0\.gamma$",
+        f"{flax_prefix}.head_norm.scale",
+        _squeeze,
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.head.2",
+        f"{flax_prefix}.head_conv.conv",
+    )
+
+
+def _add_droid_vae_decoder_rules(
+    builder: KeyMappingBuilder,
+    pt_prefix: str,
+    flax_prefix: str,
+) -> None:
+    """Map DROID VAE decoder flat upsamples to Flax staged layout.
+
+    DROID flat indices for decoder (dim_mults=(1,2,4,4), num_res_blocks=2):
+      0,1,2  -> stage 0, blocks 0,1,2
+      3      -> stage 0, resample (spatial .resample.1 + temporal .time_conv)
+      4,5,6  -> stage 1, blocks 0,1,2
+      7      -> stage 1, resample (spatial .resample.1 + temporal .time_conv)
+      8,9,10 -> stage 2, blocks 0,1,2
+      11     -> stage 2, resample (spatial .resample.1, no temporal)
+      12,13,14 -> stage 3, blocks 0,1,2
+    """
+    _add_conv_rules(builder, f"{pt_prefix}.conv1", f"{flax_prefix}.stem.conv")
+
+    dec_layout = [
+        (0, 0, 0), (1, 0, 1), (2, 0, 2),
+        (4, 1, 0), (5, 1, 1), (6, 1, 2),
+        (8, 2, 0), (9, 2, 1), (10, 2, 2),
+        (12, 3, 0), (13, 3, 1), (14, 3, 2),
+    ]
+    for flat_idx, stage, block in dec_layout:
+        _add_droid_residual_block_rules(
+            builder,
+            f"{pt_prefix}.upsamples.{flat_idx}",
+            f"{flax_prefix}.stages.{stage}.blocks.{block}",
+        )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.3.resample.1",
+        f"{flax_prefix}.stages.0.resample.0.conv.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.3.time_conv",
+        f"{flax_prefix}.stages.0.resample.1.conv",
+    )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.7.resample.1",
+        f"{flax_prefix}.stages.1.resample.0.conv.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.7.time_conv",
+        f"{flax_prefix}.stages.1.resample.1.conv",
+    )
+
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.11.resample.1",
+        f"{flax_prefix}.stages.2.resample.0.conv",
+    )
+
+    _add_droid_residual_block_rules(
+        builder,
+        f"{pt_prefix}.middle.0",
+        f"{flax_prefix}.mid_block1",
+    )
+    _add_droid_attn_block_rules(
+        builder,
+        f"{pt_prefix}.middle.1",
+        f"{flax_prefix}.mid_attn",
+    )
+    _add_droid_residual_block_rules(
+        builder,
+        f"{pt_prefix}.middle.2",
+        f"{flax_prefix}.mid_block2",
+    )
+
+    builder.add_rule(
+        rf"^{re.escape(pt_prefix)}\.head\.0\.gamma$",
+        f"{flax_prefix}.head_norm.scale",
+        _squeeze,
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.head.2",
+        f"{flax_prefix}.head_conv.conv",
     )
 
 
@@ -466,37 +737,30 @@ def _add_category_specific_mlp_rules(
 
 
 def build_key_mapping(config: Any) -> KeyMappingBuilder:
-    """Build a complete PyTorch -> Flax key mapping for DreamZero.
+    """Build a complete PyTorch -> Flax key mapping for DreamZero-DROID.
 
-    Args:
-        config: A ``DreamZeroConfig`` instance (or compatible object with
-            the same attributes).
+    Expects PyTorch keys with ``action_head.`` prefix stripped (use
+    ``prefix_strip="action_head."`` in :func:`convert_checkpoint`).
 
-    Returns:
-        A ``KeyMappingBuilder`` with all rules registered.
+    The DROID checkpoint uses these sub-module prefixes:
+      - ``model.*``          -> ``dit.*``         (CausalWanDiT)
+      - ``text_encoder.*``   -> ``text_encoder.*``
+      - ``image_encoder.*``  -> ``image_encoder.*``
+      - ``vae.*``            -> ``vae.*``
     """
     b = KeyMappingBuilder()
     has_image = getattr(config, "has_image_input", True)
     qk_norm = getattr(config, "qk_norm", True)
-    cross_attn_norm = getattr(config, "cross_attn_norm", False)
-    num_layers = getattr(config, "num_layers", 30)
+    num_layers = getattr(config, "num_layers", 40)
 
     # ---------------------------------------------------------------
-    # model.dit (CausalWanDiT)
+    # model -> dit (CausalWanDiT)
     # ---------------------------------------------------------------
-    dit_pt = "model.dit"
+    dit_pt = "model"
     dit_fl = "dit"
 
-    # Patch embedding (PatchEmbed3D -> proj is a Conv)
-    _add_conv_rules(b, f"{dit_pt}.patch_embedding.proj", f"{dit_fl}.patch_embedding.proj")
-
-    # Time embedding (MLP: Sequential with .0 and .2)
+    _add_conv_rules(b, f"{dit_pt}.patch_embedding", f"{dit_fl}.patch_embedding.proj")
     _add_mlp_rules(b, f"{dit_pt}.time_embedding", f"{dit_fl}.time_embedding")
-
-    # Time projection (single linear, applied after SiLU)
-    _add_linear_rules(b, f"{dit_pt}.time_projection", f"{dit_fl}.time_projection")
-    # Handle the case where PyTorch wraps it in Sequential(SiLU, Linear)
-    # time_projection.1.weight -> time_projection.kernel
     b.add_rule(
         rf"^{re.escape(dit_pt)}\.time_projection\.1\.weight$",
         f"{dit_fl}.time_projection.kernel",
@@ -506,15 +770,13 @@ def build_key_mapping(config: Any) -> KeyMappingBuilder:
         rf"^{re.escape(dit_pt)}\.time_projection\.1\.bias$",
         f"{dit_fl}.time_projection.bias",
     )
-
-    # Text embedding (MLP)
     _add_mlp_rules(b, f"{dit_pt}.text_embedding", f"{dit_fl}.text_embedding")
 
-    # Image embedding projection (MLPProj)
     if has_image:
-        _add_mlp_proj_rules(b, f"{dit_pt}.img_emb", f"{dit_fl}.img_emb")
+        _add_mlp_proj_sequential_rules(
+            b, f"{dit_pt}.img_emb.proj", f"{dit_fl}.img_emb",
+        )
 
-    # DiT blocks
     for i in range(num_layers):
         _add_dit_block_rules(
             b,
@@ -522,32 +784,26 @@ def build_key_mapping(config: Any) -> KeyMappingBuilder:
             f"{dit_fl}.blocks.{i}",
             has_image_input=has_image,
             qk_norm=qk_norm,
-            cross_attn_norm=cross_attn_norm,
         )
 
-    # Output head
     _add_dit_head_rules(b, f"{dit_pt}.head", f"{dit_fl}.head")
 
-    # Action-specific: state_encoder, action_encoder, action_decoder
     _add_category_specific_mlp_rules(
         b, f"{dit_pt}.state_encoder", f"{dit_fl}.state_encoder",
     )
-
-    # MultiEmbodimentActionEncoder: W1, W2, W3 (CategorySpecificLinear)
     for w_name in ("W1", "W2", "W3"):
         _add_category_specific_linear_rules(
             b, f"{dit_pt}.action_encoder.{w_name}",
             f"{dit_fl}.action_encoder.{w_name}",
         )
-
     _add_category_specific_mlp_rules(
         b, f"{dit_pt}.action_decoder", f"{dit_fl}.action_decoder",
     )
 
     # ---------------------------------------------------------------
-    # model.text_encoder (WanTextEncoder)
+    # text_encoder (WanTextEncoder)
     # ---------------------------------------------------------------
-    te_pt = "model.text_encoder"
+    te_pt = "text_encoder"
     te_fl = "text_encoder"
 
     _add_embed_rules(b, f"{te_pt}.token_embedding", f"{te_fl}.token_embedding")
@@ -557,353 +813,134 @@ def build_key_mapping(config: Any) -> KeyMappingBuilder:
         blk_pt = f"{te_pt}.blocks.{i}"
         blk_fl = f"{te_fl}.blocks.{i}"
 
-        # RMSNorm (norm1, norm2)
         _add_layernorm_rules(b, f"{blk_pt}.norm1", f"{blk_fl}.norm1", has_bias=False)
         _add_layernorm_rules(b, f"{blk_pt}.norm2", f"{blk_fl}.norm2", has_bias=False)
 
-        # T5Attention: q, k, v, o (no bias)
         for proj in ("q", "k", "v", "o"):
             _add_linear_rules(
                 b, f"{blk_pt}.attn.{proj}", f"{blk_fl}.attn.{proj}", use_bias=False,
             )
 
-        # T5FeedForward: gate, fc1, fc2 (no bias)
-        for fc_name in ("gate", "fc1", "fc2"):
+        _add_text_encoder_gate_rules(
+            b, f"{blk_pt}.ffn.gate", f"{blk_fl}.ffn.gate",
+        )
+        for fc_name in ("fc1", "fc2"):
             _add_linear_rules(
-                b, f"{blk_pt}.ffn.{fc_name}", f"{blk_fl}.ffn.{fc_name}", use_bias=False,
+                b, f"{blk_pt}.ffn.{fc_name}", f"{blk_fl}.ffn.{fc_name}",
+                use_bias=False,
             )
 
-        # Per-layer relative position embedding (if not shared)
         _add_embed_rules(
             b, f"{blk_pt}.pos_embedding.embedding",
             f"{blk_fl}.pos_embedding.embedding",
         )
-        # Alternative naming: direct embedding attribute
-        _add_embed_rules(
-            b, f"{blk_pt}.pos_embedding",
-            f"{blk_fl}.pos_embedding.embedding",
-        )
 
-    # Shared position embedding (if used)
-    _add_embed_rules(
-        b, f"{te_pt}.pos_embedding.embedding",
-        f"{te_fl}.pos_embedding.embedding",
-    )
-
-    # Final norm
     _add_layernorm_rules(b, f"{te_pt}.norm", f"{te_fl}.norm", has_bias=False)
 
     # ---------------------------------------------------------------
-    # model.image_encoder (WanImageEncoder -> visual -> VisionTransformer)
+    # image_encoder (WanImageEncoder: model.visual -> visual)
     # ---------------------------------------------------------------
-    ie_pt = "model.image_encoder.visual"
+    ie_pt = "image_encoder.model.visual"
     ie_fl = "image_encoder.visual"
 
-    # Patch embedding conv
     _add_conv_rules(b, f"{ie_pt}.patch_embedding", f"{ie_fl}.patch_embedding")
-    # Alternative: some checkpoints name it conv1
-    _add_conv_rules(b, f"{ie_pt}.conv1", f"{ie_fl}.patch_embedding")
 
-    # CLS token
     b.add_rule(
         rf"^{re.escape(ie_pt)}\.cls_embedding$",
         f"{ie_fl}.cls_embedding.value",
     )
     b.add_rule(
-        rf"^{re.escape(ie_pt)}\.class_embedding$",
-        f"{ie_fl}.cls_embedding.value",
-    )
-
-    # Positional embedding
-    b.add_rule(
         rf"^{re.escape(ie_pt)}\.pos_embedding$",
         f"{ie_fl}.pos_embedding.value",
     )
-    b.add_rule(
-        rf"^{re.escape(ie_pt)}\.positional_embedding$",
-        f"{ie_fl}.pos_embedding.value",
-    )
-
-    # Pre-norm
     _add_layernorm_rules(b, f"{ie_pt}.pre_norm", f"{ie_fl}.pre_norm")
-    _add_layernorm_rules(b, f"{ie_pt}.ln_pre", f"{ie_fl}.pre_norm")
-
-    # Post-norm
-    _add_layernorm_rules(
-        b, f"{ie_pt}.post_norm_layer", f"{ie_fl}.post_norm_layer",
-    )
-    _add_layernorm_rules(b, f"{ie_pt}.ln_post", f"{ie_fl}.post_norm_layer")
-
-    # Output head (projection matrix as nnx.Param)
+    _add_layernorm_rules(b, f"{ie_pt}.post_norm", f"{ie_fl}.post_norm_layer")
     b.add_rule(
         rf"^{re.escape(ie_pt)}\.head$",
         f"{ie_fl}.head.value",
     )
+
     b.add_rule(
-        rf"^{re.escape(ie_pt)}\.proj$",
-        f"{ie_fl}.head.value",
+        rf"^image_encoder\.model\.log_scale$",
+        "image_encoder.log_scale.value",
     )
 
-    # ViT transformer blocks
     image_num_layers = getattr(config, "image_num_layers", 32)
     for i in range(image_num_layers):
         vblk_pt = f"{ie_pt}.transformer.{i}"
         vblk_fl = f"{ie_fl}.transformer.{i}"
 
-        # Alternative naming: resblocks
-        vblk_pt_alt = f"{ie_pt}.transformer.resblocks.{i}"
+        _add_layernorm_rules(b, f"{vblk_pt}.norm1", f"{vblk_fl}.norm1")
+        _add_layernorm_rules(b, f"{vblk_pt}.norm2", f"{vblk_fl}.norm2")
 
-        for prefix_pt in (vblk_pt, vblk_pt_alt):
-            # LayerNorm
-            _add_layernorm_rules(b, f"{prefix_pt}.norm1", f"{vblk_fl}.norm1")
-            _add_layernorm_rules(b, f"{prefix_pt}.norm2", f"{vblk_fl}.norm2")
-            _add_layernorm_rules(b, f"{prefix_pt}.ln_1", f"{vblk_fl}.norm1")
-            _add_layernorm_rules(b, f"{prefix_pt}.ln_2", f"{vblk_fl}.norm2")
+        _add_linear_rules(b, f"{vblk_pt}.attn.to_qkv", f"{vblk_fl}.attn.to_qkv")
+        _add_linear_rules(b, f"{vblk_pt}.attn.proj", f"{vblk_fl}.attn.proj")
 
-            # Self-attention: fused QKV (to_qkv) and output projection (proj)
-            _add_linear_rules(
-                b, f"{prefix_pt}.attn.to_qkv", f"{vblk_fl}.attn.to_qkv",
-            )
-            _add_linear_rules(
-                b, f"{prefix_pt}.attn.proj", f"{vblk_fl}.attn.proj",
-            )
-            # Alternative naming: in_proj_weight/bias, out_proj
-            b.add_rule(
-                rf"^{re.escape(prefix_pt)}\.attn\.in_proj_weight$",
-                f"{vblk_fl}.attn.to_qkv.kernel",
-                _transpose_dense,
-            )
-            b.add_rule(
-                rf"^{re.escape(prefix_pt)}\.attn\.in_proj_bias$",
-                f"{vblk_fl}.attn.to_qkv.bias",
-            )
-            _add_linear_rules(
-                b, f"{prefix_pt}.attn.out_proj", f"{vblk_fl}.attn.proj",
-            )
-
-            # MLP: fc1, fc2
-            _add_linear_rules(b, f"{prefix_pt}.fc1", f"{vblk_fl}.fc1")
-            _add_linear_rules(b, f"{prefix_pt}.fc2", f"{vblk_fl}.fc2")
-            # Alternative naming: mlp.c_fc, mlp.c_proj (OpenAI CLIP)
-            _add_linear_rules(b, f"{prefix_pt}.mlp.c_fc", f"{vblk_fl}.fc1")
-            _add_linear_rules(b, f"{prefix_pt}.mlp.c_proj", f"{vblk_fl}.fc2")
+        _add_linear_rules(b, f"{vblk_pt}.mlp.0", f"{vblk_fl}.fc1")
+        _add_linear_rules(b, f"{vblk_pt}.mlp.2", f"{vblk_fl}.fc2")
 
     # ---------------------------------------------------------------
-    # model.vae (WanVideoVAE -> encoder, decoder)
+    # vae (WanVideoVAE: model.encoder/decoder)
     # ---------------------------------------------------------------
-    _add_vae_rules(b, "model.vae", "vae", config)
+    _add_droid_vae_encoder_rules(b, "vae.model.encoder", "vae.encoder")
+    _add_droid_vae_decoder_rules(b, "vae.model.decoder", "vae.decoder")
+
+    b.add_rule(r"^vae\.model\.conv1\.weight$", "vae.mean.value", _identity)
+    b.add_rule(r"^vae\.model\.conv1\.bias$", "vae.mean_bias.value", _identity)
+    b.add_rule(r"^vae\.model\.conv2\.weight$", "vae.std.value", _identity)
+    b.add_rule(r"^vae\.model\.conv2\.bias$", "vae.std_bias.value", _identity)
 
     return b
 
 
-def _add_vae_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-    config: Any,
-) -> None:
-    """Add rules for WanVideoVAE (encoder + decoder)."""
-    _add_vae_encoder_rules(builder, f"{pt_prefix}.encoder", f"{flax_prefix}.encoder", config)
-    _add_vae_decoder_rules(builder, f"{pt_prefix}.decoder", f"{flax_prefix}.decoder", config)
+# ---------------------------------------------------------------------------
+# Fused QKV post-processing
+# ---------------------------------------------------------------------------
 
 
-def _add_causal_conv3d_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-) -> None:
-    """Add rules for CausalConv3d (wraps a single conv)."""
-    _add_conv_rules(builder, f"{pt_prefix}.conv", f"{flax_prefix}.conv")
-    # Some checkpoints may name the inner conv directly
-    _add_conv_rules(builder, pt_prefix, f"{flax_prefix}.conv")
+def _split_fused_qkv_params(
+    converted: dict[tuple[str, ...], jax.Array],
+) -> tuple[dict[tuple[str, ...], jax.Array], int]:
+    """Split ``_fused_qkv`` entries into separate q_proj/k_proj/v_proj.
 
+    Returns the updated dict and the number of new entries added
+    (for bookkeeping: each fused pair produces 2 extra entries).
+    """
+    to_remove: list[tuple[str, ...]] = []
+    to_add: dict[tuple[str, ...], jax.Array] = {}
+    extra_count = 0
 
-def _add_residual_block_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-) -> None:
-    """Add rules for ResidualBlock."""
-    _add_layernorm_rules(builder, f"{pt_prefix}.norm1", f"{flax_prefix}.norm1", has_bias=False)
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.conv1", f"{flax_prefix}.conv1")
-    _add_layernorm_rules(builder, f"{pt_prefix}.norm2", f"{flax_prefix}.norm2", has_bias=False)
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.conv2", f"{flax_prefix}.conv2")
-    # Shortcut (optional)
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.shortcut", f"{flax_prefix}.shortcut")
-    # Alternative: skip_conv / nin_shortcut
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.skip_conv", f"{flax_prefix}.shortcut")
-    _add_causal_conv3d_rules(
-        builder, f"{pt_prefix}.nin_shortcut", f"{flax_prefix}.shortcut",
-    )
+    for path, arr in list(converted.items()):
+        if "_fused_qkv" not in path:
+            continue
 
+        idx = path.index("_fused_qkv")
+        base = path[:idx]
+        suffix = path[idx + 1:]
 
-def _add_attention_block_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-) -> None:
-    """Add rules for VAE AttentionBlock."""
-    _add_layernorm_rules(builder, f"{pt_prefix}.norm", f"{flax_prefix}.norm", has_bias=False)
-    attn_pt = f"{pt_prefix}.attn"
-    attn_fl = f"{flax_prefix}.attn"
-    _add_linear_rules(builder, f"{attn_pt}.q_proj", f"{attn_fl}.q_proj")
-    _add_linear_rules(builder, f"{attn_pt}.k_proj", f"{attn_fl}.k_proj")
-    _add_linear_rules(builder, f"{attn_pt}.v_proj", f"{attn_fl}.v_proj")
-    _add_linear_rules(builder, f"{attn_pt}.out_proj", f"{attn_fl}.out_proj")
+        is_kernel = suffix == ("kernel",)
+        is_bias = suffix == ("bias",)
+        if not (is_kernel or is_bias):
+            continue
 
+        to_remove.append(path)
+        chunk_size = arr.shape[-1 if is_kernel else 0] // 3
 
-def _add_vae_encoder_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-    config: Any,
-) -> None:
-    """Add rules for Encoder3d."""
-    # Stem
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.stem", f"{flax_prefix}.stem")
+        for i, proj in enumerate(("q_proj", "k_proj", "v_proj")):
+            if is_kernel:
+                chunk = arr[:, i * chunk_size : (i + 1) * chunk_size]
+            else:
+                chunk = arr[i * chunk_size : (i + 1) * chunk_size]
+            new_path = base + (proj,) + suffix
+            to_add[new_path] = chunk
+            extra_count += 1
 
-    # Stages (dynamic number based on dim_multipliers)
-    num_stages = 4  # default: (1, 2, 4, 4)
-    num_res_blocks = 2
-    for s in range(num_stages):
-        for j in range(num_res_blocks):
-            _add_residual_block_rules(
-                builder,
-                f"{pt_prefix}.stages.{s}.blocks.{j}",
-                f"{flax_prefix}.stages.{s}.blocks.{j}",
-            )
-            # Alternative PyTorch naming: encoder.down.{s}.block.{j}
-            _add_residual_block_rules(
-                builder,
-                f"{pt_prefix}.down.{s}.block.{j}",
-                f"{flax_prefix}.stages.{s}.blocks.{j}",
-            )
+    for path in to_remove:
+        del converted[path]
+        extra_count -= 1
 
-        # Resample layers
-        for r in range(3):  # up to 3 resample layers per stage
-            resample_pt = f"{pt_prefix}.stages.{s}.resample.{r}"
-            resample_fl = f"{flax_prefix}.stages.{s}.resample.{r}"
-            # SpatialDownsample
-            _add_conv_rules(builder, f"{resample_pt}.conv", f"{resample_fl}.conv")
-            # TemporalDownsample (CausalConv3d)
-            _add_causal_conv3d_rules(builder, f"{resample_pt}", f"{resample_fl}")
-            # Alternative naming: encoder.down.{s}.downsample
-            _add_conv_rules(
-                builder,
-                f"{pt_prefix}.down.{s}.downsample.conv",
-                f"{resample_fl}.conv",
-            )
-
-    # Middle blocks
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid_block1", f"{flax_prefix}.mid_block1",
-    )
-    _add_attention_block_rules(
-        builder, f"{pt_prefix}.mid_attn", f"{flax_prefix}.mid_attn",
-    )
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid_block2", f"{flax_prefix}.mid_block2",
-    )
-    # Alternative naming: mid.block_1, mid.attn_1, mid.block_2
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid.block_1", f"{flax_prefix}.mid_block1",
-    )
-    _add_attention_block_rules(
-        builder, f"{pt_prefix}.mid.attn_1", f"{flax_prefix}.mid_attn",
-    )
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid.block_2", f"{flax_prefix}.mid_block2",
-    )
-
-    # Head
-    _add_layernorm_rules(
-        builder, f"{pt_prefix}.head_norm", f"{flax_prefix}.head_norm", has_bias=False,
-    )
-    _add_causal_conv3d_rules(
-        builder, f"{pt_prefix}.head_conv", f"{flax_prefix}.head_conv",
-    )
-    # Alternative: norm_out, conv_out
-    _add_layernorm_rules(
-        builder, f"{pt_prefix}.norm_out", f"{flax_prefix}.head_norm", has_bias=False,
-    )
-    _add_causal_conv3d_rules(
-        builder, f"{pt_prefix}.conv_out", f"{flax_prefix}.head_conv",
-    )
-
-
-def _add_vae_decoder_rules(
-    builder: KeyMappingBuilder,
-    pt_prefix: str,
-    flax_prefix: str,
-    config: Any,
-) -> None:
-    """Add rules for Decoder3d."""
-    # Stem
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.stem", f"{flax_prefix}.stem")
-    # Alternative naming: conv_in
-    _add_causal_conv3d_rules(builder, f"{pt_prefix}.conv_in", f"{flax_prefix}.stem")
-
-    # Middle blocks
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid_block1", f"{flax_prefix}.mid_block1",
-    )
-    _add_attention_block_rules(
-        builder, f"{pt_prefix}.mid_attn", f"{flax_prefix}.mid_attn",
-    )
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid_block2", f"{flax_prefix}.mid_block2",
-    )
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid.block_1", f"{flax_prefix}.mid_block1",
-    )
-    _add_attention_block_rules(
-        builder, f"{pt_prefix}.mid.attn_1", f"{flax_prefix}.mid_attn",
-    )
-    _add_residual_block_rules(
-        builder, f"{pt_prefix}.mid.block_2", f"{flax_prefix}.mid_block2",
-    )
-
-    # Stages
-    num_stages = 4
-    num_dec_blocks = 3  # num_res_blocks + 1
-    for s in range(num_stages):
-        for j in range(num_dec_blocks):
-            _add_residual_block_rules(
-                builder,
-                f"{pt_prefix}.stages.{s}.blocks.{j}",
-                f"{flax_prefix}.stages.{s}.blocks.{j}",
-            )
-            _add_residual_block_rules(
-                builder,
-                f"{pt_prefix}.up.{s}.block.{j}",
-                f"{flax_prefix}.stages.{s}.blocks.{j}",
-            )
-
-        # Resample layers
-        for r in range(3):
-            resample_pt = f"{pt_prefix}.stages.{s}.resample.{r}"
-            resample_fl = f"{flax_prefix}.stages.{s}.resample.{r}"
-            _add_conv_rules(builder, f"{resample_pt}.conv", f"{resample_fl}.conv")
-            _add_causal_conv3d_rules(builder, f"{resample_pt}", f"{resample_fl}")
-            _add_conv_rules(
-                builder,
-                f"{pt_prefix}.up.{s}.upsample.conv",
-                f"{resample_fl}.conv",
-            )
-
-    # Head
-    _add_layernorm_rules(
-        builder, f"{pt_prefix}.head_norm", f"{flax_prefix}.head_norm", has_bias=False,
-    )
-    _add_causal_conv3d_rules(
-        builder, f"{pt_prefix}.head_conv", f"{flax_prefix}.head_conv",
-    )
-    _add_layernorm_rules(
-        builder, f"{pt_prefix}.norm_out", f"{flax_prefix}.head_norm", has_bias=False,
-    )
-    _add_causal_conv3d_rules(
-        builder, f"{pt_prefix}.conv_out", f"{flax_prefix}.head_conv",
-    )
+    converted.update(to_add)
+    return converted, extra_count
 
 
 # ---------------------------------------------------------------------------
@@ -916,7 +953,7 @@ def convert_checkpoint(
     config: Any,
     *,
     strict: bool = False,
-    prefix_strip: str | None = None,
+    prefix_strip: str | None = "action_head.",
 ) -> dict[tuple[str, ...], jax.Array]:
     """Convert a PyTorch state dict to a flat dict of Flax arrays.
 
@@ -924,8 +961,8 @@ def convert_checkpoint(
         pt_state_dict: PyTorch parameter name -> numpy array.
         config: A ``DreamZeroConfig`` instance.
         strict: If True, raise on unmapped PyTorch keys.
-        prefix_strip: Optional prefix to strip from all PyTorch keys
-            before mapping (e.g. ``"module."`` for DDP checkpoints).
+        prefix_strip: Prefix to strip from all PyTorch keys before mapping.
+            Defaults to ``"action_head."`` for DROID checkpoints.
 
     Returns:
         Dictionary mapping Flax pytree path tuples to JAX arrays.
@@ -953,6 +990,9 @@ def convert_checkpoint(
         arr = mapping.transform(pt_value)
         converted[mapping.flax_path] = jnp.array(arr)
         mapped_count += 1
+
+    converted, split_count = _split_fused_qkv_params(converted)
+    mapped_count += split_count
 
     logger.info(
         "Converted %d/%d parameters (%d unmapped)",
@@ -1103,7 +1143,7 @@ def apply_to_model(
                 missing_in_converted.append(".".join(flax_path))
 
     # Reconstruct the model from the updated state
-    nnx.update(model, nnx.merge(graphdef, state))
+    nnx.update(model, state)
 
     extra_keys = [
         k for k in converted_params
@@ -1209,7 +1249,7 @@ def convert_and_apply(
     config: Any,
     *,
     strict: bool = False,
-    prefix_strip: str | None = None,
+    prefix_strip: str | None = "action_head.",
 ) -> tuple[int, list[str], list[tuple[str, ...]]]:
     """End-to-end: load PyTorch checkpoint, convert, and apply to model.
 
