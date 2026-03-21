@@ -79,10 +79,10 @@ class MLPProj(nnx.Module):
     ):
         self.norm_in = nnx.LayerNorm(in_dim, param_dtype=param_dtype, rngs=rngs)
         self.linear1 = nnx.Linear(
-            in_dim, out_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            in_dim, in_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
         self.linear2 = nnx.Linear(
-            out_dim, out_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            in_dim, out_dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
         self.norm_out = nnx.LayerNorm(out_dim, param_dtype=param_dtype, rngs=rngs)
 

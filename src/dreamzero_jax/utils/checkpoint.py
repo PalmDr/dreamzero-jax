@@ -218,8 +218,11 @@ class KeyMappingBuilder:
     order; the first match wins.
     """
 
+    _SKIP_SENTINEL = "__SKIP__"
+
     def __init__(self) -> None:
         self._rules: list[tuple[re.Pattern, str, Callable]] = []
+        self._skip_patterns: list[re.Pattern] = []
 
     def add_rule(
         self,
@@ -236,6 +239,17 @@ class KeyMappingBuilder:
         """
         self._rules.append((re.compile(pattern), replacement, transform))
 
+    def add_skip(self, pattern: str) -> None:
+        """Register a PT key pattern to skip during conversion.
+
+        Matched keys are silently ignored (no "unmapped" warning).
+        """
+        self._skip_patterns.append(re.compile(pattern))
+
+    def is_skipped(self, pt_key: str) -> bool:
+        """Return True if the key matches any skip pattern."""
+        return any(p.search(pt_key) for p in self._skip_patterns)
+
     def map_key(self, pt_key: str) -> ParamMapping | None:
         """Map a single PyTorch key.
 
@@ -245,7 +259,6 @@ class KeyMappingBuilder:
         for regex, replacement, transform in self._rules:
             new_key, n = regex.subn(replacement, pt_key)
             if n > 0:
-                # Convert dot-separated path to tuple
                 flax_path = tuple(new_key.split("."))
                 return ParamMapping(flax_path=flax_path, transform=transform)
         return None
@@ -678,29 +691,31 @@ def _add_droid_vae_decoder_rules(
             f"{flax_prefix}.stages.{stage}.blocks.{block}",
         )
 
-    # Stages 0,1: temporal (index 0) + spatial (index 1).
-    # TemporalUpsample wraps CausalConv3d -> .conv.conv is the nnx.Conv.
+    # Stages 0,1: spatial (index 0) + temporal (index 1).
+    # Decoder order is opposite of encoder: SpatialUpsample first (reduces
+    # channels), then TemporalUpsample on the reduced channel count.
     # SpatialUpsample has .conv directly as nnx.Conv.
-    _add_conv_rules(
-        builder,
-        f"{pt_prefix}.upsamples.3.time_conv",
-        f"{flax_prefix}.stages.0.resample.0.conv.conv",
-    )
+    # TemporalUpsample wraps CausalConv3d -> .conv.conv is the nnx.Conv.
     _add_conv_rules(
         builder,
         f"{pt_prefix}.upsamples.3.resample.1",
-        f"{flax_prefix}.stages.0.resample.1.conv",
+        f"{flax_prefix}.stages.0.resample.0.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.3.time_conv",
+        f"{flax_prefix}.stages.0.resample.1.conv.conv",
     )
 
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.time_conv",
-        f"{flax_prefix}.stages.1.resample.0.conv.conv",
+        f"{pt_prefix}.upsamples.7.resample.1",
+        f"{flax_prefix}.stages.1.resample.0.conv",
     )
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.resample.1",
-        f"{flax_prefix}.stages.1.resample.1.conv",
+        f"{pt_prefix}.upsamples.7.time_conv",
+        f"{flax_prefix}.stages.1.resample.1.conv.conv",
     )
 
     # Stage 2: spatial only (index 0), no temporal.
@@ -892,10 +907,11 @@ def build_key_mapping(config: Any) -> KeyMappingBuilder:
     _add_droid_vae_encoder_rules(b, "vae.model.encoder", "vae.encoder")
     _add_droid_vae_decoder_rules(b, "vae.model.decoder", "vae.decoder")
 
-    b.add_rule(r"^vae\.model\.conv1\.weight$", "vae.mean.value", _identity)
-    b.add_rule(r"^vae\.model\.conv1\.bias$", "vae.mean_bias.value", _identity)
-    b.add_rule(r"^vae\.model\.conv2\.weight$", "vae.std.value", _identity)
-    b.add_rule(r"^vae\.model\.conv2\.bias$", "vae.std_bias.value", _identity)
+    # VAE normalization conv layers (conv1 = mean, conv2 = std) are skipped:
+    # the Flax model uses precomputed constant vectors (_LATENT_MEAN / _LATENT_STD)
+    # instead of learned 1x1x1 convolutions.
+    b.add_skip(r"^vae\.model\.conv1\.")
+    b.add_skip(r"^vae\.model\.conv2\.")
 
     return b
 
@@ -988,6 +1004,9 @@ def convert_checkpoint(
         # Also strip "module." from DDP wrapping
         if key.startswith("module."):
             key = key[len("module."):]
+
+        if builder.is_skipped(key):
+            continue
 
         mapping = builder.map_key(key)
         if mapping is None:
