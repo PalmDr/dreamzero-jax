@@ -15,9 +15,13 @@ Peak weight memory is max(encoders, DiT) ~ 4.82 GB/chip instead of the sum.
 from __future__ import annotations
 
 import gc
+import logging
+from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from dreamzero_jax.models.action_head import CausalWanDiT
@@ -28,6 +32,8 @@ from dreamzero_jax.schedulers.flow_euler import (
     euler_step,
     make_flow_euler_schedule,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _hbm_usage_str() -> str:
@@ -238,6 +244,139 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
     return InferenceOutput(action_pred=final_actions, video_pred=final_video)
 
 
+PT_PREFIX_MAP = {
+    "text_encoder": "action_head.text_encoder.",
+    "image_encoder": "action_head.image_encoder.",
+    "vae": "action_head.vae.",
+    "dit": "action_head.model.",
+}
+
+
+def _detect_checkpoint_format(checkpoint_dir: Path) -> str:
+    """Return 'orbax', 'pytorch', or 'npy' based on directory contents."""
+    if (checkpoint_dir / "model.safetensors.index.json").exists():
+        return "pytorch"
+    if (checkpoint_dir / "model.safetensors").exists():
+        return "pytorch"
+    npy_files = list(checkpoint_dir.glob("*.npy"))
+    if npy_files:
+        return "npy"
+    if (checkpoint_dir / "_METADATA").exists() or (
+        checkpoint_dir / "default"
+    ).is_dir():
+        return "orbax"
+    return "pytorch"
+
+
+def _load_pt_state_filtered(
+    checkpoint_dir: Path,
+    pt_prefix: str,
+) -> dict[str, np.ndarray]:
+    """Load a PT checkpoint and return only keys matching the given prefix."""
+    from dreamzero_jax.utils.hf_download import load_checkpoint_auto
+
+    full_state = load_checkpoint_auto(checkpoint_dir)
+    return {
+        k: v for k, v in full_state.items()
+        if k.startswith(pt_prefix)
+    }
+
+
+def _load_npy_state_filtered(
+    checkpoint_dir: Path,
+    flax_prefix: str,
+) -> dict[tuple[str, ...], jax.Array]:
+    """Load .npy files whose path starts with the flax sub-model prefix."""
+    result: dict[tuple[str, ...], jax.Array] = {}
+    for npy_path in sorted(checkpoint_dir.glob("*.npy")):
+        key_str = npy_path.stem
+        if not key_str.startswith(flax_prefix):
+            continue
+        relative_key = key_str[len(flax_prefix):]
+        if relative_key.startswith("."):
+            relative_key = relative_key[1:]
+        flax_path = tuple(relative_key.split("."))
+        result[flax_path] = jnp.array(np.load(npy_path))
+    return result
+
+
+def _load_weights_for_submodel(
+    model: Any,
+    config: Any,
+    checkpoint_dir: Path,
+    component: str,
+    ckpt_format: str,
+    verbose: bool = True,
+) -> None:
+    """Load checkpoint weights into a single sub-model (in-place).
+
+    Args:
+        model: The Flax NNX sub-model instance (on CPU).
+        config: DreamZeroConfig for key mapping rules.
+        checkpoint_dir: Path to the checkpoint directory.
+        component: One of 'text_encoder', 'image_encoder', 'vae', 'dit'.
+        ckpt_format: 'pytorch' or 'npy'.
+        verbose: Log progress.
+    """
+    from dreamzero_jax.utils.checkpoint import (
+        apply_to_model,
+        convert_checkpoint,
+    )
+
+    if ckpt_format == "pytorch":
+        pt_prefix = PT_PREFIX_MAP[component]
+        filtered = _load_pt_state_filtered(checkpoint_dir, pt_prefix)
+        if not filtered:
+            logger.warning(
+                "No PT keys with prefix %r found for %s", pt_prefix, component,
+            )
+            return
+        if verbose:
+            logger.info(
+                "Converting %d PT params for %s", len(filtered), component,
+            )
+        converted = convert_checkpoint(
+            filtered, config, prefix_strip="action_head.",
+        )
+        n_applied, missing, extra = apply_to_model(model, converted)
+        if verbose:
+            logger.info(
+                "%s: applied %d params (%d missing, %d extra)",
+                component, n_applied, len(missing), len(extra),
+            )
+
+    elif ckpt_format == "npy":
+        flax_prefix = component
+        params = _load_npy_state_filtered(checkpoint_dir, flax_prefix)
+        if not params:
+            logger.warning(
+                "No .npy files with prefix %r found for %s",
+                flax_prefix, component,
+            )
+            return
+        if verbose:
+            logger.info(
+                "Applying %d .npy params for %s", len(params), component,
+            )
+        from dreamzero_jax.utils.checkpoint import apply_to_model
+        n_applied, missing, extra = apply_to_model(model, params)
+        if verbose:
+            logger.info(
+                "%s: applied %d params (%d missing, %d extra)",
+                component, n_applied, len(missing), len(extra),
+            )
+
+    elif ckpt_format == "orbax":
+        from dreamzero_jax.utils.checkpoint import load_flax_checkpoint
+        state = load_flax_checkpoint(checkpoint_dir, model)
+        nnx.update(model, state)
+        if verbose:
+            logger.info("%s: loaded orbax checkpoint", component)
+
+    else:
+        raise ValueError(f"Unknown checkpoint format: {ckpt_format}")
+
+
 def generate_staged(
     config,
     video: jax.Array,
@@ -253,6 +392,7 @@ def generate_staged(
     mesh: jax.sharding.Mesh | None = None,
     verbose: bool = True,
     quantize_int8: bool = False,
+    checkpoint_dir: str | Path | None = None,
 ):
     """Staged inference: encoders and DiT are never loaded simultaneously.
 
@@ -280,6 +420,12 @@ def generate_staged(
         key: PRNG key for noise initialization.
         mesh: Device mesh for sharding. If None, no sharding is applied.
         verbose: Print HBM usage at each phase boundary.
+        quantize_int8: Quantize DiT weights to INT8 before sharding.
+        checkpoint_dir: Path to a checkpoint directory. Supports:
+            - PyTorch safetensors (sharded or single) — converted on the fly
+            - Directory of ``.npy`` files keyed by flax path
+            - Orbax checkpoint directory
+            When None, uses random initialization (for testing only).
 
     Returns:
         InferenceOutput with ``action_pred`` and ``video_pred``.
@@ -292,15 +438,75 @@ def generate_staged(
     cpu_device = jax.devices("cpu")[0]
     cpu_ctx = jax.default_device(cpu_device)
 
+    ckpt_path = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    ckpt_fmt = _detect_checkpoint_format(ckpt_path) if ckpt_path else None
+
     def _log(msg: str) -> None:
         if verbose:
             print(f"  [staged] {msg}  ({_hbm_usage_str()})")
+
+    # For pytorch checkpoints, load the full state dict once and reuse it
+    # across sub-models to avoid redundant disk I/O on sharded safetensors.
+    _pt_cache: dict[str, dict[str, np.ndarray] | None] = {"state": None}
+
+    def _get_pt_state() -> dict[str, np.ndarray]:
+        if _pt_cache["state"] is None:
+            from dreamzero_jax.utils.hf_download import load_checkpoint_auto
+            assert ckpt_path is not None
+            _pt_cache["state"] = load_checkpoint_auto(ckpt_path)
+        return _pt_cache["state"]
+
+    def _load_component(model: Any, component: str) -> None:
+        """Load weights for a sub-model from the checkpoint."""
+        if ckpt_path is None:
+            return
+        assert ckpt_fmt is not None
+        if ckpt_fmt == "pytorch":
+            from dreamzero_jax.utils.checkpoint import (
+                apply_to_model,
+                convert_checkpoint,
+            )
+            pt_prefix = PT_PREFIX_MAP[component]
+            full_state = _get_pt_state()
+            filtered = {
+                k: v for k, v in full_state.items()
+                if k.startswith(pt_prefix)
+            }
+            if not filtered:
+                logger.warning(
+                    "No PT keys with prefix %r for %s", pt_prefix, component,
+                )
+                return
+            _log(f"converting {len(filtered)} PT params -> {component}")
+            converted = convert_checkpoint(
+                filtered, config, prefix_strip="action_head.",
+            )
+            n_applied, missing, extra = apply_to_model(model, converted)
+            _log(
+                f"{component}: {n_applied} applied, "
+                f"{len(missing)} missing, {len(extra)} extra"
+            )
+        elif ckpt_fmt == "npy":
+            _load_weights_for_submodel(
+                model, config, ckpt_path, component, "npy", verbose,
+            )
+        elif ckpt_fmt == "orbax":
+            _load_weights_for_submodel(
+                model, config, ckpt_path, component, "orbax", verbose,
+            )
 
     # ---- Phase 1: Encoders ----
     _log("Phase 1: creating encoders on CPU")
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
     with cpu_ctx:
         text_enc, img_enc, vae = _create_encoders(config, rngs)
+
+    if ckpt_path is not None:
+        _log("Phase 1: loading encoder weights from checkpoint")
+        with cpu_ctx:
+            _load_component(text_enc, "text_encoder")
+            _load_component(img_enc, "image_encoder")
+            _load_component(vae, "vae")
 
     if mesh is not None:
         _log("Phase 1: sharding encoder weights to TPU")
@@ -323,11 +529,21 @@ def generate_staged(
     gc.collect()
     _log("Phase 1: encoders deleted (caches cleared)")
 
+    # Free the cached PT state if encoder keys are no longer needed
+    # and DiT keys will be re-read from the same cache.
+    # (Keep cache alive — DiT loading will use it next.)
+
     # ---- Phase 2: DiT ----
     _log("Phase 2: creating DiT on CPU")
     rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
     with cpu_ctx:
         dit = _create_dit(config, rngs)
+
+        if ckpt_path is not None:
+            _log("Phase 2: loading DiT weights from checkpoint")
+            _load_component(dit, "dit")
+
+        _pt_cache["state"] = None
 
         if quantize_int8:
             from dreamzero_jax.utils.quantize import quantize_model
