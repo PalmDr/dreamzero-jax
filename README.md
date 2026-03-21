@@ -1,5 +1,9 @@
 # DreamZero-JAX
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![JAX](https://img.shields.io/badge/JAX-0.4.35+-green.svg)](https://github.com/jax-ml/jax)
+
 **JAX/Flax port of NVIDIA's DreamZero 14B World Action Model, optimized for Google TPUs with custom Pallas kernels.**
 
 DreamZero is a World Action Model that jointly predicts actions and videos from language instructions and visual observations, achieving zero-shot generalization to unseen robotics tasks. This repo is a from-scratch JAX/Flax NNX reimplementation targeting TPU v5e pods, with custom Pallas kernels for the performance-critical DiT backbone.
@@ -162,6 +166,10 @@ This project uses **uv** for package management.
 3. **Phase 3** — Training pipeline with distributed data loading
 4. **Phase 4** — Optimization (Pallas kernels, DiT caching, multi-host)
 
+## Contributing
+
+Contributions are welcome. Please open an issue first to discuss what you would like to change.
+
 ## References
 
 - [DreamZero Paper](https://dreamzero0.github.io/DreamZero.pdf)
@@ -169,3 +177,7 @@ This project uses **uv** for package management.
 - [JAX Documentation](https://jax.readthedocs.io/)
 - [Flax NNX Documentation](https://flax.readthedocs.io/en/latest/nnx/)
 - [TPU Best Practices](https://cloud.google.com/tpu/docs/best-practices)
+
+## License
+
+This project is licensed under the Apache License 2.0 -- see [LICENSE](LICENSE) for details.

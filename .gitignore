@@ -5,24 +5,49 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.egg
 
 # Virtual environments
 .venv/
 venv/
+env/
 
 # IDE
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
+.project
+.classpath
 
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # OS
 .DS_Store
+Thumbs.db
 
-# Project specific
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Project specific — model weights and checkpoints
 *.ckpt
 *.safetensors
+*.msgpack
+*.orbax/
+checkpoints/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code internal state
+.claude/
