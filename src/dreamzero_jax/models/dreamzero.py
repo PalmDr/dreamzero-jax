@@ -42,7 +42,7 @@ class DreamZeroConfig:
 
     # DiT
     dim: int = 1536
-    in_channels: int = 16
+    in_channels: int = 36
     out_channels: int = 16
     ffn_dim: int = 8960
     freq_dim: int = 256
@@ -68,7 +68,7 @@ class DreamZeroConfig:
     image_patch_size: int = 14
     image_dim: int = 1280
     image_mlp_ratio: int = 4
-    image_out_dim: int = 512
+    image_out_dim: int = 1024
     image_num_heads: int = 16
     image_num_layers: int = 32
 
