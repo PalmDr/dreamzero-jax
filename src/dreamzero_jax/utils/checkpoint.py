@@ -1073,18 +1073,15 @@ def apply_to_model(
 
     graphdef, state = nnx.split(model)
 
-    # Flatten the state to get all variable paths
-    flat_state = _flatten_state(state)
-
     applied = 0
     missing_in_converted: list[str] = []
     used_converted_keys: set[tuple[str, ...]] = set()
 
-    for flax_path, var_state in flat_state.items():
+    for raw_path, var_state in state.flat_state():
         if not isinstance(var_state, nnx.VariableState):
             continue
 
-        # Try direct match
+        flax_path = tuple(str(k) for k in raw_path)
         if flax_path in converted_params:
             new_value = converted_params[flax_path]
             old_shape = var_state.value.shape
