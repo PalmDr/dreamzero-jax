@@ -289,30 +289,15 @@ Parity testing uses **deterministic synthetic inputs** (not real robot data):
 ## Roadmap
 
 ### Done
-- [x] Full 14B architecture port (DiT, VAE, text/image encoders, action head)
-- [x] Weight conversion pipeline (100% coverage, 0 missing)
-- [x] 26/26 component numerical parity with PyTorch
-- [x] Staged inference (encoder offloading for TPU HBM management)
-- [x] DiT 40L backbone at 242ms on v5e-8
-- [x] Batch scaling benchmarks (MXU elbow at batch=16)
-- [x] 130 unit tests passing
-- [x] Apache 2.0 license
+- [x] Full 14B JAX/Flax port with 26/26 component parity
+- [x] Weight conversion (100% coverage) and inference on TPU v5e
+- [x] 130 unit tests, Apache 2.0
 
 ### Next
-- [ ] Full end-to-end parity test (requires GR00T framework setup for PyTorch side)
-- [ ] bf16 mixed-precision without f32 matmul fallback
-- [ ] 40L full pipeline on v5e-8 (XLA program size optimization)
-- [ ] Multi-host v5e-16 inference
-- [ ] INT8 weight quantization for production
-- [ ] Real robot video input (mp4/camera stream)
-- [ ] Integration with [Axon](https://github.com/ironleaf-ai/axon-runtime) robotics middleware
-- [ ] DiT caching (cosine similarity thresholding, 16→4 effective steps)
-- [ ] Ironwood TPU benchmarks
-
-### Known Limitations
-- **bf16 matmul causes NaN** with real weights — use `jax_default_matmul_precision="float32"` (2x slower but numerically stable)
-- **40L full pipeline OOMs on v5e-8** — the XLA compiled scan program exceeds 16 GB/chip. Use staged inference with ≤24 layers, or v5e-16 for full 40L
-- **CPU inference is impractical** — 14B model needs ~65 GB RAM in f32. Use TPU or GPU
+- [ ] **Training consistency** — benchmark training loss curves GPU (PyTorch) vs TPU (JAX) on the same data, verify convergence matches
+- [ ] **Latency / throughput / TCO** — head-to-head GPU (H100, A100) vs TPU (v5e, v6e) benchmarks for inference and training, with full cost-of-ownership analysis
+- [ ] **Multi-slice training & inference** — lightweight multi-host support for v5e-16+ pods using JAX's distributed runtime
+- [ ] **Custom Pallas kernels** — fused attention, AdaLN, and RoPE kernels to further optimize latency, throughput, and memory profile on TPU
 
 ---
 
