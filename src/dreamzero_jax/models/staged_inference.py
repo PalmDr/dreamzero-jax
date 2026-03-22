@@ -251,6 +251,31 @@ PT_PREFIX_MAP = {
     "dit": "action_head.model.",
 }
 
+FLAX_PREFIX_MAP = {
+    "text_encoder": "text_encoder",
+    "image_encoder": "image_encoder",
+    "vae": "vae",
+    "dit": "dit",
+}
+
+
+def _filter_converted_for_component(
+    converted: dict[tuple[str, ...], Any],
+    component: str,
+) -> dict[tuple[str, ...], Any]:
+    """Filter converted params by Flax prefix and strip it for sub-model application.
+
+    The full conversion produces paths like ("text_encoder", "layers", "0", ...),
+    but a sub-model's flat_state has relative paths like ("layers", "0", ...).
+    This strips the leading component prefix so apply_to_model can match.
+    """
+    flax_prefix = FLAX_PREFIX_MAP[component]
+    result: dict[tuple[str, ...], Any] = {}
+    for path, value in converted.items():
+        if path and path[0] == flax_prefix:
+            result[path[1:]] = value
+    return result
+
 
 def _detect_checkpoint_format(checkpoint_dir: Path) -> str:
     """Return 'orbax', 'pytorch', or 'npy' based on directory contents."""
@@ -324,21 +349,20 @@ def _load_weights_for_submodel(
     )
 
     if ckpt_format == "pytorch":
-        pt_prefix = PT_PREFIX_MAP[component]
-        filtered = _load_pt_state_filtered(checkpoint_dir, pt_prefix)
-        if not filtered:
-            logger.warning(
-                "No PT keys with prefix %r found for %s", pt_prefix, component,
-            )
-            return
+        from dreamzero_jax.utils.hf_download import load_checkpoint_auto
+        full_state = load_checkpoint_auto(checkpoint_dir)
         if verbose:
             logger.info(
-                "Converting %d PT params for %s", len(filtered), component,
+                "Converting %d PT params (full) for %s", len(full_state), component,
             )
-        converted = convert_checkpoint(
-            filtered, config, prefix_strip="action_head.",
-        )
-        n_applied, missing, extra = apply_to_model(model, converted)
+        full_converted = convert_checkpoint(full_state, config, prefix_strip="action_head.")
+        subset = _filter_converted_for_component(full_converted, component)
+        if not subset:
+            logger.warning(
+                "No converted params for component %r", component,
+            )
+            return
+        n_applied, missing, extra = apply_to_model(model, subset)
         if verbose:
             logger.info(
                 "%s: applied %d params (%d missing, %d extra)",
@@ -445,16 +469,21 @@ def generate_staged(
         if verbose:
             print(f"  [staged] {msg}  ({_hbm_usage_str()})")
 
-    # For pytorch checkpoints, load the full state dict once and reuse it
-    # across sub-models to avoid redundant disk I/O on sharded safetensors.
-    _pt_cache: dict[str, dict[str, np.ndarray] | None] = {"state": None}
+    _cache: dict[str, Any] = {"pt_state": None, "converted": None}
 
-    def _get_pt_state() -> dict[str, np.ndarray]:
-        if _pt_cache["state"] is None:
+    def _get_converted() -> dict[tuple[str, ...], Any]:
+        """Convert full PT state dict once, cache for all sub-models."""
+        if _cache["converted"] is None:
+            from dreamzero_jax.utils.checkpoint import convert_checkpoint
             from dreamzero_jax.utils.hf_download import load_checkpoint_auto
             assert ckpt_path is not None
-            _pt_cache["state"] = load_checkpoint_auto(ckpt_path)
-        return _pt_cache["state"]
+            pt_state = load_checkpoint_auto(ckpt_path)
+            _log(f"converting {len(pt_state)} PT params (full checkpoint)")
+            _cache["converted"] = convert_checkpoint(
+                pt_state, config, prefix_strip="action_head.",
+            )
+            _cache["pt_state"] = pt_state
+        return _cache["converted"]
 
     def _load_component(model: Any, component: str) -> None:
         """Load weights for a sub-model from the checkpoint."""
@@ -462,26 +491,17 @@ def generate_staged(
             return
         assert ckpt_fmt is not None
         if ckpt_fmt == "pytorch":
-            from dreamzero_jax.utils.checkpoint import (
-                apply_to_model,
-                convert_checkpoint,
-            )
-            pt_prefix = PT_PREFIX_MAP[component]
-            full_state = _get_pt_state()
-            filtered = {
-                k: v for k, v in full_state.items()
-                if k.startswith(pt_prefix)
-            }
-            if not filtered:
+            from dreamzero_jax.utils.checkpoint import apply_to_model
+            full_converted = _get_converted()
+            subset = _filter_converted_for_component(full_converted, component)
+            if not subset:
                 logger.warning(
-                    "No PT keys with prefix %r for %s", pt_prefix, component,
+                    "No converted params for component %r (flax prefix %r)",
+                    component, FLAX_PREFIX_MAP[component],
                 )
                 return
-            _log(f"converting {len(filtered)} PT params -> {component}")
-            converted = convert_checkpoint(
-                filtered, config, prefix_strip="action_head.",
-            )
-            n_applied, missing, extra = apply_to_model(model, converted)
+            _log(f"applying {len(subset)} converted params -> {component}")
+            n_applied, missing, extra = apply_to_model(model, subset)
             _log(
                 f"{component}: {n_applied} applied, "
                 f"{len(missing)} missing, {len(extra)} extra"
@@ -543,7 +563,8 @@ def generate_staged(
             _log("Phase 2: loading DiT weights from checkpoint")
             _load_component(dit, "dit")
 
-        _pt_cache["state"] = None
+        _cache["pt_state"] = None
+        _cache["converted"] = None
 
         if quantize_int8:
             from dreamzero_jax.utils.quantize import quantize_model
