@@ -77,8 +77,8 @@ class DreamZeroConfig:
     vae_base_dim: int = 96
 
     # Action
-    action_dim: int = 7
-    state_dim: int = 14
+    action_dim: int = 32
+    state_dim: int = 64
     action_hidden_size: int = 1024
     num_action_per_block: int = 32
     num_state_per_block: int = 1

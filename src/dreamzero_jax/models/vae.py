@@ -511,16 +511,16 @@ class Decoder3d(nnx.Module):
             })
 
             # Upsample (all stages except the last).
-            # Order: SpatialUpsample first (reduces channels), then
-            # TemporalUpsample — matches DROID decoder execution order.
+            # DROID order: TemporalUpsample first (on full channels),
+            # then SpatialUpsample (halves channels).
             if i < len(rev_dims) - 1:
                 spatial_out = out_ch // 2
                 resample_layers = nnx.List([])
+                if rev_temporal[i]:
+                    resample_layers.append(TemporalUpsample(out_ch, **kw))
                 resample_layers.append(
                     SpatialUpsample(out_ch, spatial_out, **kw),
                 )
-                if rev_temporal[i]:
-                    resample_layers.append(TemporalUpsample(spatial_out, **kw))
                 stage["resample"] = resample_layers
                 stage_in_ch = spatial_out
             else:

@@ -691,31 +691,31 @@ def _add_droid_vae_decoder_rules(
             f"{flax_prefix}.stages.{stage}.blocks.{block}",
         )
 
-    # Stages 0,1: spatial (index 0) + temporal (index 1).
-    # Decoder order is opposite of encoder: SpatialUpsample first (reduces
-    # channels), then TemporalUpsample on the reduced channel count.
-    # SpatialUpsample has .conv directly as nnx.Conv.
+    # Stages 0,1: temporal (index 0) + spatial (index 1).
+    # DROID order: TemporalUpsample first (on full channels), then
+    # SpatialUpsample (halves channels).
     # TemporalUpsample wraps CausalConv3d -> .conv.conv is the nnx.Conv.
-    _add_conv_rules(
-        builder,
-        f"{pt_prefix}.upsamples.3.resample.1",
-        f"{flax_prefix}.stages.0.resample.0.conv",
-    )
+    # SpatialUpsample has .conv directly as nnx.Conv.
     _add_conv_rules(
         builder,
         f"{pt_prefix}.upsamples.3.time_conv",
-        f"{flax_prefix}.stages.0.resample.1.conv.conv",
+        f"{flax_prefix}.stages.0.resample.0.conv.conv",
+    )
+    _add_conv_rules(
+        builder,
+        f"{pt_prefix}.upsamples.3.resample.1",
+        f"{flax_prefix}.stages.0.resample.1.conv",
     )
 
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.resample.1",
-        f"{flax_prefix}.stages.1.resample.0.conv",
+        f"{pt_prefix}.upsamples.7.time_conv",
+        f"{flax_prefix}.stages.1.resample.0.conv.conv",
     )
     _add_conv_rules(
         builder,
-        f"{pt_prefix}.upsamples.7.time_conv",
-        f"{flax_prefix}.stages.1.resample.1.conv.conv",
+        f"{pt_prefix}.upsamples.7.resample.1",
+        f"{flax_prefix}.stages.1.resample.1.conv",
     )
 
     # Stage 2: spatial only (index 0), no temporal.
