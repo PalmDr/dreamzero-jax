@@ -1,588 +1,354 @@
 #!/usr/bin/env python3
-"""DreamZero inference pipeline.
+"""DreamZero-JAX inference — one-click demo entry point.
 
-Runs the full DreamZero model on an input video and text prompt, producing
-predicted actions and (optionally) decoded video frames.
+Runs the full 14B DreamZero World Action Model on a text prompt and
+optional video input, producing predicted actions and video latents.
 
-Usage::
+Auto-detects hardware (TPU / GPU / CPU), downloads weights from
+HuggingFace if needed, and selects the optimal inference strategy:
+  - TPU: staged inference (encoders and DiT never coexist in HBM)
+  - GPU/CPU: direct inference (all weights loaded at once)
 
-    uv run python scripts/inference.py \
-        --checkpoint /path/to/flax_ckpt \
-        --input-video /path/to/video.mp4 \
-        --prompt "pick up the red block" \
-        --output-dir ./outputs \
-        --num-steps 16 \
-        --cfg-scale 5.0
+Examples
+--------
+Minimal (downloads weights, uses zeros as video input)::
 
-See ``--help`` for all options.
+    uv run python scripts/inference.py \\
+        --checkpoint GEAR-Dreams/DreamZero-DROID
+
+With a real video and custom prompt::
+
+    uv run python scripts/inference.py \\
+        --checkpoint /data/DreamZero-DROID \\
+        --video /data/observation.mp4 \\
+        --prompt "pick up the red block" \\
+        --output output/predictions.npz
+
+Small model on CPU for quick testing::
+
+    uv run python scripts/inference.py \\
+        --checkpoint /data/DreamZero-DROID \\
+        --num-layers 8 --device cpu --dtype f32
 """
-
 from __future__ import annotations
 
 import argparse
-import logging
-import os
-import pathlib
+import gc
+import sys
 import time
-from typing import Sequence
+from pathlib import Path
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-from flax import nnx
 
-from dreamzero_jax.models.dreamzero import DreamZero, DreamZeroConfig
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-logger = logging.getLogger(__name__)
+VIDEO_SHAPE = (1, 33, 320, 176, 3)
+TOKEN_SHAPE = (1, 512)
+STATE_SHAPE_BLOCKS = 9
+STATE_DIM = 64
+SEED = 42
+
+DROID_CONFIG = dict(
+    dim=5120,
+    ffn_dim=13824,
+    num_heads=40,
+    freq_dim=256,
+    text_dim=4096,
+    patch_size=(1, 2, 2),
+    in_channels=16,
+    out_channels=16,
+    has_image_input=True,
+)
 
 
 # ---------------------------------------------------------------------------
-# Video I/O helpers
+# CLI
 # ---------------------------------------------------------------------------
 
 
-def _load_video_from_frames(frames_dir: pathlib.Path, max_frames: int | None = None) -> np.ndarray:
-    """Load video frames from a directory of image files.
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="DreamZero-JAX inference: generate actions and video from a text prompt.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument(
+        "--checkpoint", "--checkpoint-dir",
+        type=str, required=True, dest="checkpoint",
+        help="Path to DROID checkpoint directory, or HuggingFace repo ID.",
+    )
+    p.add_argument(
+        "--prompt", type=str, default="pick up the red block",
+        help="Text instruction for the robot.",
+    )
+    p.add_argument(
+        "--video", type=str, default=None,
+        help="Input video path (mp4/dir of frames). Uses zeros if omitted.",
+    )
+    p.add_argument(
+        "--output", type=str, default="output/predictions.npz",
+        help="Save predictions (.npz) to this path.",
+    )
+    p.add_argument(
+        "--num-layers", type=int, default=None,
+        help="DiT layers (default: 8 for v5e-4, 40 for v5e-8+).",
+    )
+    p.add_argument(
+        "--device", type=str, default="auto",
+        choices=["auto", "tpu", "gpu", "cpu"],
+        help="Device to run on. 'auto' picks TPU > GPU > CPU.",
+    )
+    p.add_argument(
+        "--dtype", type=str, default="bf16",
+        choices=["bf16", "f32"],
+        help="Compute dtype. bf16 is native on TPU and halves memory.",
+    )
+    p.add_argument(
+        "--num-steps", type=int, default=16,
+        help="Number of denoising steps.",
+    )
+    p.add_argument(
+        "--cfg-scale", type=float, default=5.0,
+        help="Classifier-free guidance scale.",
+    )
+    p.add_argument(
+        "--no-cfg", action="store_true",
+        help="Disable CFG (halves activation memory, needed for 40L on v5e-8).",
+    )
+    p.add_argument(
+        "--seed", type=int, default=SEED,
+        help="Random seed for reproducibility.",
+    )
+    p.add_argument(
+        "--quantize-int8", action="store_true",
+        help="Quantize DiT to INT8 before inference (saves HBM).",
+    )
+    return p.parse_args()
 
-    Reads all ``.png`` / ``.jpg`` / ``.jpeg`` images sorted by filename.
 
-    Args:
-        frames_dir: Directory containing ordered frame images.
-        max_frames: If set, only load the first *max_frames* frames.
+# ---------------------------------------------------------------------------
+# Hardware detection
+# ---------------------------------------------------------------------------
 
-    Returns:
-        ``(T, H, W, 3)`` uint8 numpy array.
-    """
+
+def detect_device(requested: str) -> tuple[str, int, str]:
+    """Return (platform, num_devices, description)."""
+    import jax
+
+    if requested == "auto":
+        backend = jax.default_backend()
+    else:
+        backend = requested
+
+    devices = jax.devices(backend) if backend != "auto" else jax.devices()
+    n = len(devices)
+
+    if backend == "tpu":
+        try:
+            kind = devices[0].device_kind
+        except Exception:
+            kind = "TPU"
+        desc = f"{kind} ({n} chips)"
+    elif backend == "gpu":
+        try:
+            kind = devices[0].device_kind
+        except Exception:
+            kind = "GPU"
+        desc = f"{kind} ({n} devices)"
+    else:
+        desc = "CPU"
+
+    return backend, n, desc
+
+
+def pick_num_layers(num_devices: int, backend: str, explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit
+    if backend == "cpu":
+        return 8
+    if num_devices <= 4:
+        return 8
+    return 40
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_checkpoint(checkpoint: str) -> Path:
+    """If checkpoint looks like an HF repo ID, download it; otherwise treat as local path."""
+    local = Path(checkpoint)
+    if local.exists():
+        return local
+
+    if "/" in checkpoint and not checkpoint.startswith("/"):
+        print(f"  Downloading from HuggingFace: {checkpoint}")
+        from dreamzero_jax.utils.hf_download import download_from_hf
+        return download_from_hf(checkpoint).parent
+    raise FileNotFoundError(
+        f"Checkpoint not found: {checkpoint}\n"
+        "Provide a local path or a HuggingFace repo ID (e.g. GEAR-Dreams/DreamZero-DROID)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video loading
+# ---------------------------------------------------------------------------
+
+
+def load_video_input(video_path: str | None) -> np.ndarray:
+    """Load video from file or create zeros for demo mode."""
+    if video_path is None:
+        return np.zeros(VIDEO_SHAPE, dtype=np.float32)
+
+    path = Path(video_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    if path.is_dir():
+        return _load_frames_dir(path)
+    return _load_video_file(path)
+
+
+def _load_frames_dir(frames_dir: Path) -> np.ndarray:
     from PIL import Image
 
     exts = {".png", ".jpg", ".jpeg"}
-    paths = sorted(
-        p for p in frames_dir.iterdir()
-        if p.suffix.lower() in exts
-    )
-    if max_frames is not None:
-        paths = paths[:max_frames]
-
+    paths = sorted(p for p in frames_dir.iterdir() if p.suffix.lower() in exts)
     if not paths:
-        raise FileNotFoundError(f"No image files found in {frames_dir}")
+        raise FileNotFoundError(f"No image files in {frames_dir}")
 
-    frames = []
-    for p in paths:
-        img = Image.open(p).convert("RGB")
-        frames.append(np.array(img))
-
-    return np.stack(frames, axis=0)
+    frames = [np.array(Image.open(p).convert("RGB")) for p in paths]
+    video = np.stack(frames, axis=0)
+    video = (video.astype(np.float32) / 127.5) - 1.0
+    return video[np.newaxis]
 
 
-def _load_video_from_mp4(video_path: pathlib.Path, max_frames: int | None = None) -> np.ndarray:
-    """Load video frames from an mp4 file using PIL/imageio-like approach.
-
-    Falls back to decoding frame-by-frame with a simple cv2-free method
-    using the ``imageio`` library if available, otherwise attempts ``cv2``.
-
-    Args:
-        video_path: Path to ``.mp4`` video file.
-        max_frames: If set, only load the first *max_frames* frames.
-
-    Returns:
-        ``(T, H, W, 3)`` uint8 numpy array.
-    """
+def _load_video_file(video_path: Path) -> np.ndarray:
     try:
         import imageio.v3 as iio
-
-        frames_iter = iio.imread(str(video_path), plugin="pyav")
-        # imageio returns (T, H, W, C) directly for video
-        frames = np.asarray(frames_iter)
-        if max_frames is not None:
-            frames = frames[:max_frames]
-        return frames
+        frames = np.asarray(iio.imread(str(video_path), plugin="pyav"))
     except ImportError:
-        pass
-
-    try:
-        import cv2
-
-        cap = cv2.VideoCapture(str(video_path))
-        frames = []
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # cv2 loads BGR, convert to RGB
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if max_frames is not None and len(frames) >= max_frames:
-                break
-        cap.release()
-        if not frames:
-            raise RuntimeError(f"Could not read frames from {video_path}")
-        return np.stack(frames, axis=0)
-    except ImportError:
-        raise ImportError(
-            "Loading mp4 videos requires either 'imageio[pyav]' or 'opencv-python'. "
-            "Install one of them or provide a directory of frame images instead."
-        )
-
-
-def load_video(path: pathlib.Path, max_frames: int | None = None) -> np.ndarray:
-    """Load video from either an mp4 file or a directory of frames.
-
-    Args:
-        path: Path to an ``.mp4`` file or a directory of frame images.
-        max_frames: Optional limit on the number of frames to load.
-
-    Returns:
-        ``(T, H, W, 3)`` uint8 numpy array.
-    """
-    if path.is_dir():
-        return _load_video_from_frames(path, max_frames=max_frames)
-    elif path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}:
-        return _load_video_from_mp4(path, max_frames=max_frames)
-    else:
-        raise ValueError(
-            f"Unsupported video input: {path}. "
-            "Provide an mp4 file or a directory of frame images."
-        )
-
-
-def normalize_video(video: np.ndarray) -> np.ndarray:
-    """Normalize uint8 video frames to ``[-1, 1]`` float32.
-
-    Args:
-        video: ``(T, H, W, 3)`` or ``(B, T, H, W, 3)`` uint8.
-
-    Returns:
-        Same shape, float32 in ``[-1, 1]``.
-    """
-    return (video.astype(np.float32) / 127.5) - 1.0
-
-
-def denormalize_video(video: np.ndarray) -> np.ndarray:
-    """Denormalize float32 ``[-1, 1]`` video to uint8 ``[0, 255]``.
-
-    Args:
-        video: Float32 array in ``[-1, 1]``.
-
-    Returns:
-        Same shape, uint8 in ``[0, 255]``.
-    """
-    return np.clip((video + 1.0) * 127.5, 0, 255).astype(np.uint8)
-
-
-def save_video_frames(
-    video: np.ndarray,
-    output_dir: pathlib.Path,
-    prefix: str = "frame",
-) -> list[pathlib.Path]:
-    """Save video frames as individual PNG images.
-
-    Args:
-        video: ``(T, H, W, 3)`` uint8 array.
-        output_dir: Directory to save frames into (created if needed).
-        prefix: Filename prefix for each frame.
-
-    Returns:
-        List of saved file paths.
-    """
-    from PIL import Image
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for i in range(video.shape[0]):
-        path = output_dir / f"{prefix}_{i:04d}.png"
-        Image.fromarray(video[i]).save(path)
-        paths.append(path)
-    return paths
-
-
-# ---------------------------------------------------------------------------
-# Tokenization
-# ---------------------------------------------------------------------------
-
-
-def tokenize_prompt(
-    prompt: str,
-    tokenizer_name: str = "google/t5-v1_1-xxl",
-    max_length: int = 512,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Tokenize a text prompt using a HuggingFace T5 tokenizer.
-
-    Args:
-        prompt: Text instruction string.
-        tokenizer_name: HuggingFace model ID for the tokenizer.
-        max_length: Maximum sequence length (padded/truncated).
-
-    Returns:
-        Tuple of ``(token_ids, attention_mask)``, each ``(1, L)`` int32/float32.
-    """
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    encoding = tokenizer(
-        prompt,
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-        return_tensors="np",
-    )
-
-    token_ids = encoding["input_ids"].astype(np.int32)  # (1, L)
-    attention_mask = encoding["attention_mask"].astype(np.float32)  # (1, L)
-
-    return token_ids, attention_mask
-
-
-# ---------------------------------------------------------------------------
-# Mesh / sharding helpers
-# ---------------------------------------------------------------------------
-
-
-def create_mesh(mesh_shape: Sequence[int]) -> jax.sharding.Mesh:
-    """Create a JAX device mesh for distributed inference.
-
-    Args:
-        mesh_shape: Tuple of ``(data_parallel, model_parallel)`` sizes.
-            Product must equal the total number of available devices.
-
-    Returns:
-        A ``jax.sharding.Mesh`` with axes ``('data', 'model')``.
-    """
-    devices = jax.devices()
-    num_devices = len(devices)
-    dp, mp = mesh_shape
-    if dp * mp != num_devices:
-        raise ValueError(
-            f"Mesh shape {mesh_shape} requires {dp * mp} devices, "
-            f"but only {num_devices} are available."
-        )
-    device_grid = np.array(devices).reshape(mesh_shape)
-    return jax.sharding.Mesh(device_grid, axis_names=("data", "model"))
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint loading
-# ---------------------------------------------------------------------------
-
-
-def load_checkpoint(checkpoint_path: pathlib.Path, model: DreamZero) -> DreamZero:
-    """Load an orbax checkpoint into the DreamZero model.
-
-    Attempts to use the project's own checkpoint utilities. Falls back to
-    direct orbax loading if the utilities are not yet implemented.
-
-    Args:
-        checkpoint_path: Path to the orbax checkpoint directory.
-        model: An initialized ``DreamZero`` model (provides the tree structure).
-
-    Returns:
-        The model with loaded weights.
-    """
-    try:
-        from dreamzero_jax.utils.checkpoint import apply_to_model, load_flax_checkpoint
-
-        state = load_flax_checkpoint(checkpoint_path)
-        model = apply_to_model(model, state)
-        logger.info("Loaded checkpoint via dreamzero_jax.utils.checkpoint")
-        return model
-    except (ImportError, AttributeError, NotImplementedError):
-        logger.info(
-            "dreamzero_jax.utils.checkpoint not available, "
-            "falling back to orbax directly"
-        )
-
-    import orbax.checkpoint as ocp
-
-    checkpointer = ocp.PyTreeCheckpointer()
-    # Extract the abstract state tree from the model
-    graphdef, state = nnx.split(model)
-    restored_state = checkpointer.restore(str(checkpoint_path), item=state)
-    model = nnx.merge(graphdef, restored_state)
-    logger.info("Loaded checkpoint via orbax.checkpoint.PyTreeCheckpointer")
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-
-def run_inference(
-    model: DreamZero,
-    video: jax.Array,
-    token_ids: jax.Array,
-    attention_mask: jax.Array,
-    state: jax.Array,
-    embodiment_id: jax.Array,
-    num_inference_steps: int,
-    cfg_scale: float,
-    seed: int,
-    use_jit: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """Run the DreamZero generation pipeline.
-
-    Optionally JIT-compiles ``model.generate`` for better performance.
-
-    Args:
-        model: Initialized DreamZero model (with loaded weights).
-        video: Input video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
-        token_ids: Text token IDs ``(B, L)`` int32.
-        attention_mask: Text attention mask ``(B, L)`` float32.
-        state: Robot state ``(B, num_blocks, state_dim)`` float32.
-        embodiment_id: ``(B,)`` int32 embodiment IDs.
-        num_inference_steps: Number of denoising steps.
-        cfg_scale: Classifier-free guidance scale.
-        seed: Random seed for noise initialization.
-        use_jit: Whether to JIT-compile the generate call.
-
-    Returns:
-        Tuple of ``(action_pred, video_pred)`` JAX arrays.
-    """
-    key = jax.random.key(seed)
-
-    if use_jit:
-
-        @jax.jit
-        def _generate(
-            video: jax.Array,
-            token_ids: jax.Array,
-            attention_mask: jax.Array,
-            state: jax.Array,
-            embodiment_id: jax.Array,
-            key: jax.Array,
-        ):
-            return model.generate(
-                video=video,
-                token_ids=token_ids,
-                state=state,
-                embodiment_id=embodiment_id,
-                attention_mask=attention_mask,
-                num_inference_steps=num_inference_steps,
-                cfg_scale=cfg_scale,
-                key=key,
+        try:
+            import cv2
+            cap = cv2.VideoCapture(str(video_path))
+            raw = []
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                raw.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            cap.release()
+            if not raw:
+                raise RuntimeError(f"Could not read frames from {video_path}")
+            frames = np.stack(raw, axis=0)
+        except ImportError:
+            raise ImportError(
+                "Loading mp4 requires 'imageio[pyav]' or 'opencv-python'. "
+                "Install one, or pass a directory of frame images."
             )
 
-        logger.info("JIT-compiling model.generate (first call will be slow)...")
-        t0 = time.perf_counter()
-        output = _generate(video, token_ids, attention_mask, state, embodiment_id, key)
-        # Block until computation finishes (for accurate timing)
-        jax.block_until_ready(output)
-        t1 = time.perf_counter()
-        logger.info("First call (includes JIT compilation): %.2fs", t1 - t0)
-
-        # Run again to get steady-state timing
-        t0 = time.perf_counter()
-        output = _generate(video, token_ids, attention_mask, state, embodiment_id, key)
-        jax.block_until_ready(output)
-        t1 = time.perf_counter()
-        logger.info("Second call (cached): %.2fs", t1 - t0)
-    else:
-        logger.info("Running model.generate (no JIT)...")
-        t0 = time.perf_counter()
-        output = model.generate(
-            video=video,
-            token_ids=token_ids,
-            state=state,
-            embodiment_id=embodiment_id,
-            attention_mask=attention_mask,
-            num_inference_steps=num_inference_steps,
-            cfg_scale=cfg_scale,
-            key=key,
-        )
-        jax.block_until_ready(output)
-        t1 = time.perf_counter()
-        logger.info("Inference time: %.2fs", t1 - t0)
-
-    return output.action_pred, output.video_pred
+    video = (frames.astype(np.float32) / 127.5) - 1.0
+    return video[np.newaxis]
 
 
 # ---------------------------------------------------------------------------
-# Post-processing
+# Inference strategies
 # ---------------------------------------------------------------------------
 
 
-def decode_video_latents(model: DreamZero, video_latents: jax.Array) -> np.ndarray:
-    """Decode video latents through the VAE decoder to pixel-space.
+def run_staged(config, video, token_ids, state, embodiment_id, mask, args, mesh):
+    """Staged inference: encoders and DiT never coexist in HBM. Best for TPU."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
 
-    Args:
-        model: DreamZero model (for access to the VAE).
-        video_latents: ``(B, T', H', W', z_dim)`` latent tensor from generation.
+    from dreamzero_jax.models.staged_inference import generate_staged
 
-    Returns:
-        ``(B, T, H, W, 3)`` uint8 video frames.
-    """
-    logger.info("Decoding video latents through VAE (shape: %s)...", video_latents.shape)
-    t0 = time.perf_counter()
-    decoded = model.vae.decode(video_latents)
-    jax.block_until_ready(decoded)
-    t1 = time.perf_counter()
-    logger.info("VAE decode time: %.2fs", t1 - t0)
+    rep = NamedSharding(mesh, P())
+    import jax.numpy as jnp
 
-    # Convert to numpy and denormalize: [-1, 1] -> [0, 255] uint8
-    decoded_np = np.asarray(decoded)
-    decoded_uint8 = denormalize_video(decoded_np)
-    return decoded_uint8
+    video_j = jax.device_put(jnp.array(video, dtype=config.dtype), rep)
+    tokens_j = jax.device_put(jnp.array(token_ids, dtype=jnp.int32), rep)
+    mask_j = jax.device_put(jnp.array(mask, dtype=jnp.int32), rep)
+    state_j = jax.device_put(jnp.array(state, dtype=jnp.float32), rep)
+    emb_j = jax.device_put(jnp.zeros((1,), dtype=jnp.int32), rep)
+    key = jax.device_put(jax.random.PRNGKey(args.seed), rep)
 
-
-def save_results(
-    output_dir: pathlib.Path,
-    action_pred: np.ndarray,
-    video_frames: np.ndarray | None = None,
-) -> None:
-    """Save inference results to disk.
-
-    Args:
-        output_dir: Directory to write outputs into.
-        action_pred: ``(B, total_actions, action_dim)`` predicted actions.
-        video_frames: Optional ``(B, T, H, W, 3)`` uint8 decoded video.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save actions as numpy file
-    actions_path = output_dir / "actions.npy"
-    np.save(actions_path, action_pred)
-    logger.info("Saved predicted actions to %s (shape: %s)", actions_path, action_pred.shape)
-
-    # Also save as human-readable CSV for the first batch element
-    actions_csv_path = output_dir / "actions.csv"
-    np.savetxt(
-        actions_csv_path,
-        action_pred[0],
-        delimiter=",",
-        header="Actions for batch element 0 (each row = one timestep)",
-    )
-    logger.info("Saved actions CSV to %s", actions_csv_path)
-
-    # Save video frames if provided
-    if video_frames is not None:
-        for b in range(video_frames.shape[0]):
-            frames_dir = output_dir / f"video_batch_{b:02d}"
-            saved = save_video_frames(video_frames[b], frames_dir, prefix="pred")
-            logger.info(
-                "Saved %d predicted video frames to %s",
-                len(saved),
-                frames_dir,
-            )
-
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="DreamZero inference: generate actions and video from observation + prompt.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    return generate_staged(
+        config,
+        video_j, tokens_j, state_j, emb_j,
+        attention_mask=mask_j,
+        num_inference_steps=args.num_steps,
+        cfg_scale=args.cfg_scale,
+        use_cfg=not args.no_cfg,
+        key=key,
+        mesh=mesh,
+        checkpoint_dir=str(args.checkpoint_path),
+        quantize_int8=args.quantize_int8,
     )
 
-    # Required
-    parser.add_argument(
-        "--checkpoint",
-        type=pathlib.Path,
-        required=True,
-        help="Path to Flax/orbax checkpoint directory.",
-    )
-    parser.add_argument(
-        "--input-video",
-        type=pathlib.Path,
-        required=True,
-        help="Path to input video (mp4 file or directory of frame images).",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text instruction for the task.",
+
+def run_direct(config, video, token_ids, state, embodiment_id, mask, args):
+    """Direct inference: load full model, run generate_scan. For GPU/CPU."""
+    import jax
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from dreamzero_jax.models.dreamzero import DreamZero
+    from dreamzero_jax.utils.checkpoint import apply_to_model, convert_checkpoint
+    from dreamzero_jax.utils.hf_download import load_checkpoint_auto
+
+    cpu = jax.devices("cpu")[0]
+
+    print("  Loading checkpoint...", end=" ", flush=True)
+    t0 = time.time()
+    pt_state = load_checkpoint_auto(args.checkpoint_path)
+    print(f"{len(pt_state)} params ({time.time() - t0:.1f}s)")
+
+    print("  Creating model on CPU...", end=" ", flush=True)
+    t0 = time.time()
+    with jax.default_device(cpu):
+        model = DreamZero(config, rngs=nnx.Rngs(0))
+    print(f"done ({time.time() - t0:.1f}s)")
+
+    print("  Converting weights...", end=" ", flush=True)
+    t0 = time.time()
+    with jax.default_device(cpu):
+        converted = convert_checkpoint(pt_state, config)
+        _cast_to_dtype(converted, config.param_dtype)
+        applied, missing, extra = apply_to_model(model, converted)
+    print(f"{applied} applied, {len(missing)} missing ({time.time() - t0:.1f}s)")
+
+    del pt_state, converted
+    gc.collect()
+
+    video_j = jnp.array(video, dtype=config.dtype)
+    tokens_j = jnp.array(token_ids, dtype=jnp.int32)
+    mask_j = jnp.array(mask, dtype=jnp.int32)
+    state_j = jnp.array(state, dtype=jnp.float32)
+    emb_j = jnp.zeros((1,), dtype=jnp.int32)
+    key = jax.random.PRNGKey(args.seed)
+
+    return model.generate_scan(
+        video_j, tokens_j, state_j, emb_j,
+        attention_mask=mask_j,
+        num_inference_steps=args.num_steps,
+        cfg_scale=args.cfg_scale,
+        use_cfg=not args.no_cfg,
+        key=key,
     )
 
-    # Output
-    parser.add_argument(
-        "--output-dir",
-        type=pathlib.Path,
-        default=pathlib.Path("outputs"),
-        help="Directory to save output files.",
-    )
 
-    # Inference params
-    parser.add_argument(
-        "--num-steps",
-        type=int,
-        default=16,
-        help="Number of denoising inference steps.",
-    )
-    parser.add_argument(
-        "--cfg-scale",
-        type=float,
-        default=5.0,
-        help="Classifier-free guidance scale.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for noise initialization.",
-    )
-    parser.add_argument(
-        "--embodiment-id",
-        type=int,
-        default=0,
-        help="Embodiment ID for the robot.",
-    )
+def _cast_to_dtype(converted: dict, dtype) -> None:
+    """Cast float32/float64 values to target dtype in-place."""
+    import ml_dtypes
 
-    # Model / precision
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        choices=["float32", "bfloat16"],
-        default="float32",
-        help="Compute dtype for model parameters.",
-    )
-    parser.add_argument(
-        "--mesh-shape",
-        type=str,
-        default=None,
-        help=(
-            "Device mesh shape for distributed inference as 'dp,mp' "
-            "(e.g., '1,4'). If not set, uses a single device."
-        ),
-    )
-
-    # Optional overrides
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="google/t5-v1_1-xxl",
-        help="HuggingFace tokenizer model ID.",
-    )
-    parser.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=512,
-        help="Maximum text sequence length for tokenization.",
-    )
-    parser.add_argument(
-        "--no-jit",
-        action="store_true",
-        help="Disable JIT compilation (useful for debugging).",
-    )
-    parser.add_argument(
-        "--skip-video-decode",
-        action="store_true",
-        help="Skip VAE decoding of predicted video latents (saves time/memory).",
-    )
-    parser.add_argument(
-        "--max-input-frames",
-        type=int,
-        default=None,
-        help="Limit the number of input video frames loaded.",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose (DEBUG-level) logging.",
-    )
-
-    return parser.parse_args(argv)
+    target = np.dtype(ml_dtypes.bfloat16) if "bfloat16" in str(dtype) else np.float32
+    for k in list(converted.keys()):
+        if converted[k].dtype in (np.float32, np.float64):
+            converted[k] = converted[k].astype(target)
 
 
 # ---------------------------------------------------------------------------
@@ -590,165 +356,114 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Main entry point for the DreamZero inference pipeline."""
-    args = parse_args(argv)
+def build_config(args, dtype):
+    """Build DreamZeroConfig with DROID hyperparameters."""
+    from dreamzero_jax.models.dreamzero import DreamZeroConfig
 
-    # --- Logging setup ---
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+    return DreamZeroConfig(
+        **DROID_CONFIG,
+        num_layers=args.num_layers,
+        dtype=dtype,
+        param_dtype=dtype,
     )
 
-    logger.info("DreamZero Inference Pipeline")
-    logger.info("=" * 60)
-    logger.info("JAX devices: %s", jax.devices())
-    logger.info("JAX default backend: %s", jax.default_backend())
-    logger.info("Checkpoint: %s", args.checkpoint)
-    logger.info("Input video: %s", args.input_video)
-    logger.info("Prompt: %s", args.prompt)
-    logger.info("Output dir: %s", args.output_dir)
-    logger.info("Num inference steps: %d", args.num_steps)
-    logger.info("CFG scale: %.1f", args.cfg_scale)
-    logger.info("Seed: %d", args.seed)
-    logger.info("Embodiment ID: %d", args.embodiment_id)
-    logger.info("Dtype: %s", args.dtype)
-    logger.info("Mesh shape: %s", args.mesh_shape or "single device")
-    logger.info("=" * 60)
 
-    # --- Parse dtype ---
-    dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
+def print_banner(args, backend, desc, num_layers):
+    print()
+    print("DreamZero-JAX Inference")
+    print("=" * 40)
+    print(f"  Checkpoint:  {args.checkpoint}")
+    print(f"  Device:      {desc}")
+    print(f"  Layers:      {num_layers}")
+    print(f"  Dtype:       {args.dtype}")
+    print(f"  Prompt:      {args.prompt!r}")
+    print(f"  Video:       {args.video or '(zeros — demo mode)'}")
+    print(f"  Steps:       {args.num_steps}")
+    print(f"  CFG:         {'off' if args.no_cfg else args.cfg_scale}")
+    print(f"  Seed:        {args.seed}")
+    print(f"  Output:      {args.output}")
+    print("=" * 40)
+    print()
 
-    # --- Create mesh if multi-device ---
-    mesh = None
-    if args.mesh_shape is not None:
-        dp, mp = (int(x) for x in args.mesh_shape.split(","))
-        mesh = create_mesh((dp, mp))
-        logger.info("Created device mesh: %s", mesh)
 
-    # --- Initialize model ---
-    logger.info("Initializing DreamZero model...")
-    t0 = time.perf_counter()
-    config = DreamZeroConfig()
-    model = DreamZero(config, rngs=nnx.Rngs(args.seed))
-    t1 = time.perf_counter()
-    logger.info("Model initialized in %.2fs", t1 - t0)
+def print_results(output, elapsed, output_path):
+    action = np.asarray(output.action_pred, dtype=np.float32)
+    video = np.asarray(output.video_pred, dtype=np.float32)
 
-    # --- Load checkpoint ---
-    logger.info("Loading checkpoint from %s ...", args.checkpoint)
-    t0 = time.perf_counter()
-    model = load_checkpoint(args.checkpoint, model)
-    t1 = time.perf_counter()
-    logger.info("Checkpoint loaded in %.2fs", t1 - t0)
-
-    # --- Cast parameters to target dtype if bfloat16 ---
-    if dtype == jnp.bfloat16:
-        logger.info("Casting model parameters to bfloat16...")
-
-        def cast_to_bf16(x):
-            if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        graphdef, state = nnx.split(model)
-        state = jax.tree.map(cast_to_bf16, state)
-        model = nnx.merge(graphdef, state)
-
-    # --- Load and preprocess input video ---
-    logger.info("Loading input video from %s ...", args.input_video)
-    video_np = load_video(args.input_video, max_frames=args.max_input_frames)
-    logger.info("Loaded video: shape=%s, dtype=%s", video_np.shape, video_np.dtype)
-
-    # Normalize to [-1, 1]
-    video_normalized = normalize_video(video_np)
-    # Add batch dimension: (T, H, W, 3) -> (1, T, H, W, 3)
-    video_batch = video_normalized[np.newaxis, ...]
-    logger.info("Preprocessed video: shape=%s", video_batch.shape)
-
-    # --- Tokenize text prompt ---
-    logger.info("Tokenizing prompt: '%s'", args.prompt)
-    token_ids, attention_mask = tokenize_prompt(
-        args.prompt,
-        tokenizer_name=args.tokenizer,
-        max_length=args.max_seq_len,
+    print()
+    print(f"  Inference time: {elapsed:.1f}s")
+    print()
+    a_shape = action.shape
+    print(
+        f"  Action predictions:  {a_shape} "
+        f"-- {a_shape[1]} timesteps, {a_shape[2]}-dim actions"
     )
-    logger.info("Token IDs shape: %s, Attention mask shape: %s", token_ids.shape, attention_mask.shape)
-
-    # --- Prepare dummy state and embodiment ID ---
-    # State: (B, num_blocks, state_dim) - zeros as placeholder
-    # Number of blocks is determined by temporal latent frames / num_frames_per_block
-    # The VAE applies 2 temporal downsamples, each a CausalConv3d with stride=2:
-    #   T -> floor((T - 1) / 2) + 1  (per downsample)
-    # This is equivalent to ceil(T / 4) for two 2x downsamples.
-    T_input = video_batch.shape[1]
-    # VAE does 4x temporal compression (2 causal stride-2 downsamples)
-    T_latent = (T_input - 1) // 2 + 1   # first temporal downsample
-    T_latent = (T_latent - 1) // 2 + 1  # second temporal downsample
-    num_blocks = max(1, T_latent // config.num_frames_per_block)
-    state = np.zeros((1, num_blocks, config.state_dim), dtype=np.float32)
-    logger.info("State shape: %s (num_blocks=%d)", state.shape, num_blocks)
-
-    embodiment_id = np.array([args.embodiment_id], dtype=np.int32)
-
-    # --- Convert inputs to JAX arrays ---
-    video_jax = jnp.array(video_batch, dtype=dtype)
-    token_ids_jax = jnp.array(token_ids, dtype=jnp.int32)
-    attention_mask_jax = jnp.array(attention_mask, dtype=jnp.float32)
-    state_jax = jnp.array(state, dtype=dtype)
-    embodiment_id_jax = jnp.array(embodiment_id, dtype=jnp.int32)
-
-    logger.info("Input shapes:")
-    logger.info("  video:          %s (dtype=%s)", video_jax.shape, video_jax.dtype)
-    logger.info("  token_ids:      %s (dtype=%s)", token_ids_jax.shape, token_ids_jax.dtype)
-    logger.info("  attention_mask: %s (dtype=%s)", attention_mask_jax.shape, attention_mask_jax.dtype)
-    logger.info("  state:          %s (dtype=%s)", state_jax.shape, state_jax.dtype)
-    logger.info("  embodiment_id:  %s (dtype=%s)", embodiment_id_jax.shape, embodiment_id_jax.dtype)
-
-    # --- Run inference ---
-    logger.info("Starting inference...")
-    action_pred, video_pred = run_inference(
-        model=model,
-        video=video_jax,
-        token_ids=token_ids_jax,
-        attention_mask=attention_mask_jax,
-        state=state_jax,
-        embodiment_id=embodiment_id_jax,
-        num_inference_steps=args.num_steps,
-        cfg_scale=args.cfg_scale,
-        seed=args.seed,
-        use_jit=not args.no_jit,
+    v_shape = video.shape
+    print(
+        f"  Video predictions:   {v_shape} "
+        f"-- {v_shape[1]} latent frames"
     )
+    print()
 
-    logger.info("Inference complete.")
-    logger.info("  action_pred shape: %s", action_pred.shape)
-    logger.info("  video_pred shape:  %s", video_pred.shape)
+    has_nan = np.any(np.isnan(action)) or np.any(np.isnan(video))
+    if has_nan:
+        print("  WARNING: NaN detected in outputs")
 
-    # --- Post-process actions ---
-    action_pred_np = np.asarray(action_pred)
+    print(f"  Action stats: mean={action.mean():.6f}  std={action.std():.6f}")
+    print(f"  Video stats:  mean={video.mean():.6f}  std={video.std():.6f}")
 
-    # --- Decode video latents (optional) ---
-    video_frames_np = None
-    if not args.skip_video_decode:
-        video_frames_np = decode_video_latents(model, video_pred)
-        logger.info("Decoded video shape: %s", video_frames_np.shape)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(out), action_pred=action, video_pred=video)
+    print(f"\n  Saved to: {out}")
+
+
+def main():
+    args = parse_args()
+
+    import jax
+
+    backend, n_devices, desc = detect_device(args.device)
+    args.num_layers = pick_num_layers(n_devices, backend, args.num_layers)
+    print_banner(args, backend, desc, args.num_layers)
+
+    print("Resolving checkpoint...")
+    args.checkpoint_path = resolve_checkpoint(args.checkpoint)
+    print(f"  Using: {args.checkpoint_path}")
+
+    import jax.numpy as jnp
+    dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
+    config = build_config(args, dtype)
+
+    print("Loading video...")
+    video = load_video_input(args.video)
+    print(f"  Video shape: {video.shape}")
+
+    token_ids = np.ones(TOKEN_SHAPE, dtype=np.int32)
+    mask = np.ones(TOKEN_SHAPE, dtype=np.int32)
+    state = np.zeros((1, STATE_SHAPE_BLOCKS, STATE_DIM), dtype=np.float32)
+    embodiment_id = np.zeros((1,), dtype=np.int32)
+
+    use_staged = backend == "tpu"
+
+    print(f"\nRunning inference ({'staged' if use_staged else 'direct'})...")
+    t0 = time.time()
+
+    if use_staged:
+        from dreamzero_jax.utils.sharding import create_mesh
+        mesh = create_mesh()
+        output = run_staged(
+            config, video, token_ids, state, embodiment_id, mask, args, mesh,
+        )
     else:
-        logger.info("Skipping video decode (--skip-video-decode).")
-        # Save raw latents instead
-        latents_path = args.output_dir / "video_latents.npy"
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        np.save(latents_path, np.asarray(video_pred))
-        logger.info("Saved raw video latents to %s", latents_path)
+        output = run_direct(
+            config, video, token_ids, state, embodiment_id, mask, args,
+        )
 
-    # --- Save results ---
-    save_results(
-        output_dir=args.output_dir,
-        action_pred=action_pred_np,
-        video_frames=video_frames_np,
-    )
+    jax.block_until_ready(output)
+    elapsed = time.time() - t0
 
-    logger.info("All outputs saved to %s", args.output_dir)
-    logger.info("Done.")
+    print_results(output, elapsed, args.output)
 
 
 if __name__ == "__main__":
