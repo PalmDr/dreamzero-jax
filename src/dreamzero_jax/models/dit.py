@@ -517,6 +517,7 @@ class WanDiT(nnx.Module):
         num_layers: int = 30,
         patch_size: tuple[int, int, int] = (1, 2, 2),
         has_image_input: bool = False,
+        image_dim: int = 1280,
         qk_norm: bool = True,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
@@ -579,7 +580,7 @@ class WanDiT(nnx.Module):
         # Optional image embedding projection (for I2V)
         if has_image_input:
             self.img_emb = MLPProj(
-                1280, dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+                image_dim, dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
             )
 
         # Transformer blocks

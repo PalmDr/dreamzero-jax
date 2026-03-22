@@ -199,6 +199,7 @@ class DreamZero(nnx.Module):
             num_layers=config.num_layers,
             patch_size=config.patch_size,
             has_image_input=config.has_image_input,
+            image_dim=config.image_dim,
             qk_norm=config.qk_norm,
             cross_attn_norm=config.cross_attn_norm,
             use_scan=config.use_scan,
