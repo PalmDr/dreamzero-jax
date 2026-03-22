@@ -308,6 +308,7 @@ class WanImageEncoder(nnx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        self.log_scale = nnx.Param(jnp.zeros(()))
         self.image_size = image_size
 
     def encode_image(self, images: jax.Array) -> jax.Array:
