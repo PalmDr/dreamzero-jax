@@ -173,11 +173,10 @@ def test_qk_norm_in_attention():
 def test_cross_attn_no_modulation():
     """Cross-attention path has no adaptive modulation (shift/scale/gate)."""
     block = WanDiTBlock(
-        dim=DIM, num_heads=NUM_HEADS, ffn_dim=FFN_DIM, rngs=nnx.Rngs(0),
+        dim=DIM, num_heads=NUM_HEADS, ffn_dim=FFN_DIM,
+        cross_attn_norm=False, rngs=nnx.Rngs(0),
     )
-    # The cross_attn is a plain Attention module, not modulated
     assert isinstance(block.cross_attn, Attention)
-    # norm3 should not exist when cross_attn_norm=False (default)
     assert not block.cross_attn_norm
     assert not hasattr(block, "norm3")
 

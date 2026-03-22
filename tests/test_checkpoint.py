@@ -115,11 +115,10 @@ def test_key_mapping_dit_block():
     config = _small_config()
     builder = build_key_mapping(config)
 
-    # PyTorch keys are prefixed with "model.dit."
-    mapping = builder.map_key("model.dit.blocks.0.self_attn.q_proj.weight")
+    mapping = builder.map_key("model.blocks.0.self_attn.q.weight")
     assert mapping is not None
     assert "self_attn" in ".".join(mapping.flax_path)
-    assert "kernel" in ".".join(mapping.flax_path)
+    assert "q_proj" in ".".join(mapping.flax_path)
 
 
 def test_key_mapping_text_encoder():
@@ -127,7 +126,7 @@ def test_key_mapping_text_encoder():
     config = _small_config()
     builder = build_key_mapping(config)
 
-    mapping = builder.map_key("model.text_encoder.token_embedding.weight")
+    mapping = builder.map_key("text_encoder.token_embedding.weight")
     assert mapping is not None
     assert "text_encoder" in ".".join(mapping.flax_path)
 
@@ -151,7 +150,7 @@ def test_convert_checkpoint_maps_params():
     config = _small_config()
     # Create a fake PyTorch weight for a known key
     fake_state = {
-        "model.dit.blocks.0.self_attn.q_proj.weight": np.random.randn(64, 64).astype(np.float32),
+        "model.blocks.0.self_attn.q.weight": np.random.randn(64, 64).astype(np.float32),
     }
     result = convert_checkpoint(fake_state, config)
     assert len(result) == 1
