@@ -17,14 +17,12 @@ git clone https://github.com/ironleaf-ai/dreamzero-jax
 cd dreamzero-jax
 uv sync
 
-# Download weights (~28 GB)
-uv run python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='checkpoints/DreamZero-DROID')"
+# Quick test (random weights, no download needed)
+JAX_PLATFORMS=cpu uv run python scripts/inference.py --device cpu --num-layers 2
 
-# Run inference (CPU, smoke test)
-JAX_PLATFORMS=cpu uv run python scripts/inference.py \
-    --checkpoint checkpoints/DreamZero-DROID \
-    --input-video /path/to/video.mp4 \
-    --prompt "pick up the block"
+# Full inference with real weights (requires TPU — see below)
+# Download: uv run python -c "from huggingface_hub import snapshot_download; snapshot_download('GEAR-Dreams/DreamZero-DROID', local_dir='checkpoints/DreamZero-DROID')"
+# Run: uv run python scripts/inference.py --checkpoint checkpoints/DreamZero-DROID
 ```
 
 ---
@@ -272,10 +270,57 @@ uv run ruff check src/ tests/
 
 ---
 
+## For AI Agents
+
+If you're an AI agent (Claude Code, Cursor, Copilot), read **[AGENTS.md](AGENTS.md)** instead of this README. It has the codebase map, key patterns, gotchas, and common tasks you need to navigate and contribute.
+
+---
+
+## Validation Note
+
+Parity testing uses **deterministic synthetic inputs** (not real robot data):
+- Video: `torch.randn(1, 33, 320, 176, 3) * 0.1` with `torch.manual_seed(42)`
+- Tokens: `ones(1, 512)`
+- State: `torch.randn(1, 9, 64) * 0.01` with same seed
+- Both PyTorch and JAX use identical seeded inputs for exact reproducibility
+
+---
+
+## Roadmap
+
+### Done
+- [x] Full 14B architecture port (DiT, VAE, text/image encoders, action head)
+- [x] Weight conversion pipeline (100% coverage, 0 missing)
+- [x] 26/26 component numerical parity with PyTorch
+- [x] Staged inference (encoder offloading for TPU HBM management)
+- [x] DiT 40L backbone at 242ms on v5e-8
+- [x] Batch scaling benchmarks (MXU elbow at batch=16)
+- [x] 130 unit tests passing
+- [x] Apache 2.0 license
+
+### Next
+- [ ] Full end-to-end parity test (requires GR00T framework setup for PyTorch side)
+- [ ] bf16 mixed-precision without f32 matmul fallback
+- [ ] 40L full pipeline on v5e-8 (XLA program size optimization)
+- [ ] Multi-host v5e-16 inference
+- [ ] INT8 weight quantization for production
+- [ ] Real robot video input (mp4/camera stream)
+- [ ] Integration with [Axon](https://github.com/ironleaf-ai/axon-runtime) robotics middleware
+- [ ] DiT caching (cosine similarity thresholding, 16→4 effective steps)
+- [ ] Ironwood TPU benchmarks
+
+### Known Limitations
+- **bf16 matmul causes NaN** with real weights — use `jax_default_matmul_precision="float32"` (2x slower but numerically stable)
+- **40L full pipeline OOMs on v5e-8** — the XLA compiled scan program exceeds 16 GB/chip. Use staged inference with ≤24 layers, or v5e-16 for full 40L
+- **CPU inference is impractical** — 14B model needs ~65 GB RAM in f32. Use TPU or GPU
+
+---
+
 ## References
 
-- [DreamZero Paper](https://dreamzero0.github.io/DreamZero.pdf) -- Wu et al., 2025
+- [DreamZero Paper](https://dreamzero0.github.io/DreamZero.pdf) — Wu et al., 2025
 - [DreamZero GitHub (PyTorch)](https://github.com/dreamzero0/dreamzero)
+- [DROID Checkpoint on HuggingFace](https://huggingface.co/GEAR-Dreams/DreamZero-DROID)
 - [JAX Documentation](https://jax.readthedocs.io/)
 - [Flax NNX Documentation](https://flax.readthedocs.io/en/latest/nnx/)
 - [TPU Best Practices](https://cloud.google.com/tpu/docs/best-practices)

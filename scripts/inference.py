@@ -75,8 +75,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--checkpoint", "--checkpoint-dir",
-        type=str, required=True, dest="checkpoint",
-        help="Path to DROID checkpoint directory, or HuggingFace repo ID.",
+        type=str, default=None, dest="checkpoint",
+        help="Path to DROID checkpoint directory, or HuggingFace repo ID. "
+             "If omitted, uses random weights (quick test mode).",
     )
     p.add_argument(
         "--prompt", type=str, default="pick up the red block",
@@ -166,7 +167,7 @@ def pick_num_layers(num_devices: int, backend: str, explicit: int | None) -> int
     if explicit is not None:
         return explicit
     if backend == "cpu":
-        return 8
+        return 2
     if num_devices <= 4:
         return 8
     return 40
@@ -302,27 +303,29 @@ def run_direct(config, video, token_ids, state, embodiment_id, mask, args):
 
     cpu = jax.devices("cpu")[0]
 
-    print("  Loading checkpoint...", end=" ", flush=True)
-    t0 = time.time()
-    pt_state = load_checkpoint_auto(args.checkpoint_path)
-    print(f"{len(pt_state)} params ({time.time() - t0:.1f}s)")
-
     print("  Creating model on CPU...", end=" ", flush=True)
     t0 = time.time()
     with jax.default_device(cpu):
         model = DreamZero(config, rngs=nnx.Rngs(0))
     print(f"done ({time.time() - t0:.1f}s)")
 
-    print("  Converting weights...", end=" ", flush=True)
-    t0 = time.time()
-    with jax.default_device(cpu):
-        converted = convert_checkpoint(pt_state, config)
-        _cast_to_dtype(converted, config.param_dtype)
-        applied, missing, extra = apply_to_model(model, converted)
-    print(f"{applied} applied, {len(missing)} missing ({time.time() - t0:.1f}s)")
+    if args.checkpoint_path is None:
+        print("  Using random weights (no checkpoint)")
+    else:
+        print("  Loading checkpoint...", end=" ", flush=True)
+        t0 = time.time()
+        pt_state = load_checkpoint_auto(args.checkpoint_path)
+        print(f"{len(pt_state)} params ({time.time() - t0:.1f}s)")
 
-    del pt_state, converted
-    gc.collect()
+        print("  Converting weights...", end=" ", flush=True)
+        t0 = time.time()
+        with jax.default_device(cpu):
+            converted = convert_checkpoint(pt_state, config)
+            _cast_to_dtype(converted, config.param_dtype)
+            applied, missing, extra = apply_to_model(model, converted)
+        print(f"{applied} applied, {len(missing)} missing ({time.time() - t0:.1f}s)")
+        del pt_state, converted
+        gc.collect()
 
     video_j = jnp.array(video, dtype=config.dtype)
     tokens_j = jnp.array(token_ids, dtype=jnp.int32)
@@ -427,9 +430,18 @@ def main():
     args.num_layers = pick_num_layers(n_devices, backend, args.num_layers)
     print_banner(args, backend, desc, args.num_layers)
 
-    print("Resolving checkpoint...")
-    args.checkpoint_path = resolve_checkpoint(args.checkpoint)
-    print(f"  Using: {args.checkpoint_path}")
+    if backend == "cpu" and args.num_layers > 2:
+        print(f"\n  WARNING: CPU with {args.num_layers} layers will use ~{args.num_layers * 0.75:.0f} GB RAM.")
+        print("  Consider: --num-layers 2 (quick test) or --device tpu (full model)")
+        print("  Continuing anyway...\n")
+
+    if args.checkpoint is not None:
+        print("Resolving checkpoint...")
+        args.checkpoint_path = resolve_checkpoint(args.checkpoint)
+        print(f"  Using: {args.checkpoint_path}")
+    else:
+        args.checkpoint_path = None
+        print("  No checkpoint — using random weights (quick test mode)")
 
     import jax.numpy as jnp
     dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
