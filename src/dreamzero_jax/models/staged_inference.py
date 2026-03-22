@@ -242,10 +242,19 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
                 tv_b = jnp.broadcast_to(tv, (B,))
                 ta_b = jnp.broadcast_to(ta, (B,))
 
+                # Upcast to f32 for numerical stability with real weights
+                nv32 = nv.astype(jnp.float32)
+                na32 = na.astype(jnp.float32)
+                p32 = p_emb.astype(jnp.float32)
+                c32 = c_emb.astype(jnp.float32) if c_emb is not None else None
+                y32 = y_cond.astype(jnp.float32) if y_cond is not None else None
+
                 vp, ap = model(
-                    nv, tv_b, p_emb, st, emb_id, na,
-                    timestep_action=ta_b, clip_emb=c_emb, y=y_cond,
+                    nv32, tv_b, p32, st, emb_id, na32,
+                    timestep_action=ta_b, clip_emb=c32, y=y32,
                 )
+                vp = vp.astype(nv.dtype)
+                ap = ap.astype(na.dtype)
                 nv_next = euler_step(vp, nv, sv, svn)
                 na_next = euler_step(ap, na, sa, san)
                 return (nv_next, na_next), None
