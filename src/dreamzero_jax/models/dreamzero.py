@@ -273,6 +273,43 @@ class DreamZero(nnx.Module):
         return self.image_encoder.encode_image(image)
 
     # -----------------------------------------------------------------
+    # I2V conditioning
+    # -----------------------------------------------------------------
+
+    def build_i2v_cond(
+        self,
+        video: jax.Array,
+        latents: jax.Array,
+    ) -> jax.Array:
+        """Build the 20-channel I2V conditioning tensor.
+
+        Matches the PyTorch ``encode_image`` logic: VAE-encode the first
+        frame (padded with zeros for remaining frames), build a 4-channel
+        binary mask (1 for the first temporal position, 0 elsewhere), and
+        concatenate ``[mask, image_latent]`` along the channel axis.
+
+        Args:
+            video: Raw video ``(B, T, H, W, 3)`` in ``[-1, 1]``.
+            latents: Pre-computed VAE latents ``(B, T_lat, H_lat, W_lat, 16)``.
+
+        Returns:
+            ``(B, T_lat, H_lat, W_lat, 20)`` conditioning tensor.
+        """
+        B, T, H, W, _ = video.shape
+        T_lat = latents.shape[1]
+        H_lat, W_lat = latents.shape[2], latents.shape[3]
+
+        zeros_pad = jnp.zeros((B, T - 1, H, W, 3), dtype=video.dtype)
+        first_frame = video[:, :1]
+        padded = jnp.concatenate([first_frame, zeros_pad], axis=1)
+        image_latent = self.vae.encode(padded)
+
+        mask = jnp.zeros((B, T_lat, H_lat, W_lat, 4), dtype=latents.dtype)
+        mask = mask.at[:, :1, :, :, :].set(1.0)
+
+        return jnp.concatenate([mask, image_latent], axis=-1)
+
+    # -----------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------
 
@@ -316,8 +353,8 @@ class DreamZero(nnx.Module):
         # --- Encode ---
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
-        # First frame for CLIP conditioning
         clip_emb = self.encode_image(video[:, 0])
+        i2v_cond = self.build_i2v_cond(video, latents) if self.config.has_image_input else None
 
         # --- Sample timesteps (uniform) ---
         timestep_ids = jax.random.randint(
@@ -359,6 +396,7 @@ class DreamZero(nnx.Module):
             timestep_action=timesteps,
             clean_x=latents,
             clip_emb=clip_emb if self.config.has_image_input else None,
+            y=i2v_cond,
         )
 
         # --- Compute loss ---
@@ -410,6 +448,7 @@ class DreamZero(nnx.Module):
         num_steps: int,
         cfg: float,
         *,
+        i2v_cond: jax.Array | None = None,
         key: jax.Array,
         use_cfg: bool = True,
     ) -> InferenceOutput:
@@ -469,12 +508,14 @@ class DreamZero(nnx.Module):
                     state, embodiment_id, noisy_act,
                     timestep_action=t_act,
                     clip_emb=clip_emb,
+                    y=i2v_cond,
                 )
                 vid_uncond, act_uncond = self.dit(
                     noisy_vid, t_video, null_prompt,
                     state, embodiment_id, noisy_act,
                     timestep_action=t_act,
                     clip_emb=clip_emb,
+                    y=i2v_cond,
                 )
 
                 vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
@@ -496,6 +537,7 @@ class DreamZero(nnx.Module):
                     state, embodiment_id, noisy_act,
                     timestep_action=t_act,
                     clip_emb=clip_emb,
+                    y=i2v_cond,
                 )
 
                 nv = euler_step(vid_pred, noisy_vid, sigma_vid, sigma_vid_next)
@@ -581,6 +623,7 @@ class DreamZero(nnx.Module):
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0])
+        i2v_cond = self.build_i2v_cond(video, latents) if self.config.has_image_input else None
 
         num_blocks = self._compute_num_blocks(latents)
         state = self._validate_state(state, num_blocks)
@@ -621,6 +664,7 @@ class DreamZero(nnx.Module):
                 state, embodiment_id, noisy_actions,
                 timestep_action=t_act,
                 clip_emb=clip_emb if self.config.has_image_input else None,
+                y=i2v_cond,
             )
 
             if use_cfg:
@@ -629,6 +673,7 @@ class DreamZero(nnx.Module):
                     state, embodiment_id, noisy_actions,
                     timestep_action=t_act,
                     clip_emb=clip_emb if self.config.has_image_input else None,
+                    y=i2v_cond,
                 )
                 vid_pred = vid_uncond + cfg * (vid_cond - vid_uncond)
             else:
@@ -687,11 +732,13 @@ class DreamZero(nnx.Module):
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
         clip_emb = self.encode_image(video[:, 0]) if self.config.has_image_input else None
+        i2v_cond = self.build_i2v_cond(video, latents) if self.config.has_image_input else None
 
         return self._denoise_scan(
             latents, prompt_emb, clip_emb,
             state, embodiment_id,
             num_steps, cfg,
+            i2v_cond=i2v_cond,
             key=key,
             use_cfg=use_cfg,
         )
@@ -705,7 +752,7 @@ class DreamZero(nnx.Module):
         video: jax.Array,
         token_ids: jax.Array,
         attention_mask: jax.Array | None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
         """Run all encoder forward passes and return cached embeddings."""
         prompt_emb = self.encode_prompt(token_ids, attention_mask)
         latents = self.encode_video(video)
@@ -714,7 +761,12 @@ class DreamZero(nnx.Module):
             if self.config.has_image_input
             else None
         )
-        return prompt_emb, latents, clip_emb
+        i2v_cond = (
+            self.build_i2v_cond(video, latents)
+            if self.config.has_image_input
+            else None
+        )
+        return prompt_emb, latents, clip_emb, i2v_cond
 
     def _offload_encoders(self) -> None:
         """Delete encoder weights from TPU HBM after encoding is complete.
@@ -774,17 +826,23 @@ class DreamZero(nnx.Module):
         num_steps = num_inference_steps or self.config.num_inference_steps
         cfg = cfg_scale or self.config.cfg_scale
 
-        prompt_emb, latents, clip_emb = self._encode_conditioning(
+        prompt_emb, latents, clip_emb, i2v_cond = self._encode_conditioning(
             video, token_ids, attention_mask,
         )
 
-        jax.block_until_ready((prompt_emb, latents, clip_emb))
+        ready = [prompt_emb, latents]
+        if clip_emb is not None:
+            ready.append(clip_emb)
+        if i2v_cond is not None:
+            ready.append(i2v_cond)
+        jax.block_until_ready(tuple(ready))
         self._offload_encoders()
 
         return self._denoise_scan(
             latents, prompt_emb, clip_emb,
             state, embodiment_id,
             num_steps, cfg,
+            i2v_cond=i2v_cond,
             key=key,
             use_cfg=use_cfg,
         )

@@ -120,6 +120,23 @@ def _create_dit(config, rngs):
     )
 
 
+def _build_i2v_cond(vae, video, latents):
+    """Build 20-channel I2V conditioning: 4ch mask + 16ch first-frame latent."""
+    B, T, H, W, _ = video.shape
+    T_lat = latents.shape[1]
+    H_lat, W_lat = latents.shape[2], latents.shape[3]
+
+    zeros_pad = jnp.zeros((B, T - 1, H, W, 3), dtype=video.dtype)
+    first_frame = video[:, :1]
+    padded = jnp.concatenate([first_frame, zeros_pad], axis=1)
+    image_latent = vae.encode(padded)
+
+    mask = jnp.zeros((B, T_lat, H_lat, W_lat, 4), dtype=latents.dtype)
+    mask = mask.at[:, :1, :, :, :].set(1.0)
+
+    return jnp.concatenate([mask, image_latent], axis=-1)
+
+
 def _run_encoding(text_enc, img_enc, vae, video, token_ids, attention_mask, has_image_input):
     """Run all encoder forward passes under nnx.jit."""
 
@@ -130,14 +147,15 @@ def _run_encoding(text_enc, img_enc, vae, video, token_ids, attention_mask, has_
             prompt_emb = prompt_emb * mask[:, :, None]
         latents = va.encode(vid)
         clip_emb = ie.encode_image(vid[:, 0]) if has_image_input else None
-        return prompt_emb, latents, clip_emb
+        i2v_cond = _build_i2v_cond(va, vid, latents) if has_image_input else None
+        return prompt_emb, latents, clip_emb, i2v_cond
 
     return _encode(text_enc, img_enc, vae, video, token_ids, attention_mask)
 
 
 def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
                       state, embodiment_id, num_steps, cfg, *, key,
-                      use_cfg=True):
+                      i2v_cond=None, use_cfg=True):
     """Run the Euler-scan denoising loop with a standalone DiT.
 
     When ``use_cfg=False``, runs only the conditional pass per step,
@@ -188,7 +206,7 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
         null_prompt = jnp.zeros_like(prompt_emb)
 
         @nnx.jit
-        def _run_scan(model, noisy_vid, noisy_act, st, emb_id, p_emb, n_prompt, c_emb):
+        def _run_scan(model, noisy_vid, noisy_act, st, emb_id, p_emb, n_prompt, c_emb, y_cond):
             def _step(carry, xs):
                 nv, na = carry
                 (tv, ta, sv, svn, sa, san) = xs
@@ -197,11 +215,11 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
 
                 vc, ac = model(
                     nv, tv_b, p_emb, st, emb_id, na,
-                    timestep_action=ta_b, clip_emb=c_emb,
+                    timestep_action=ta_b, clip_emb=c_emb, y=y_cond,
                 )
                 vu, au = model(
                     nv, tv_b, n_prompt, st, emb_id, na,
-                    timestep_action=ta_b, clip_emb=c_emb,
+                    timestep_action=ta_b, clip_emb=c_emb, y=y_cond,
                 )
                 vp = vu + cfg * (vc - vu)
                 nv_next = euler_step(vp, nv, sv, svn)
@@ -213,11 +231,11 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
 
         final_video, final_actions = _run_scan(
             dit, noisy_video, noisy_actions,
-            state, embodiment_id, prompt_emb, null_prompt, clip_emb,
+            state, embodiment_id, prompt_emb, null_prompt, clip_emb, i2v_cond,
         )
     else:
         @nnx.jit
-        def _run_scan_no_cfg(model, noisy_vid, noisy_act, st, emb_id, p_emb, c_emb):
+        def _run_scan_no_cfg(model, noisy_vid, noisy_act, st, emb_id, p_emb, c_emb, y_cond):
             def _step(carry, xs):
                 nv, na = carry
                 (tv, ta, sv, svn, sa, san) = xs
@@ -226,7 +244,7 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
 
                 vp, ap = model(
                     nv, tv_b, p_emb, st, emb_id, na,
-                    timestep_action=ta_b, clip_emb=c_emb,
+                    timestep_action=ta_b, clip_emb=c_emb, y=y_cond,
                 )
                 nv_next = euler_step(vp, nv, sv, svn)
                 na_next = euler_step(ap, na, sa, san)
@@ -237,7 +255,7 @@ def _run_denoise_scan(dit, config, latents, prompt_emb, clip_emb,
 
         final_video, final_actions = _run_scan_no_cfg(
             dit, noisy_video, noisy_actions,
-            state, embodiment_id, prompt_emb, clip_emb,
+            state, embodiment_id, prompt_emb, clip_emb, i2v_cond,
         )
 
     from dreamzero_jax.models.dreamzero import InferenceOutput
@@ -535,12 +553,17 @@ def generate_staged(
         vae = shard_params(vae, mesh, param_dtype=config.param_dtype)
 
     _log("Phase 1: running encoding")
-    prompt_emb, latents, clip_emb = _run_encoding(
+    prompt_emb, latents, clip_emb, i2v_cond = _run_encoding(
         text_enc, img_enc, vae,
         video, token_ids, attention_mask,
         config.has_image_input,
     )
-    jax.block_until_ready((prompt_emb, latents, clip_emb))
+    ready = [prompt_emb, latents]
+    if clip_emb is not None:
+        ready.append(clip_emb)
+    if i2v_cond is not None:
+        ready.append(i2v_cond)
+    jax.block_until_ready(tuple(ready))
     _log("Phase 1: encoding complete, deleting encoder weights")
 
     del text_enc, img_enc, vae
@@ -583,6 +606,7 @@ def generate_staged(
         state, embodiment_id,
         num_steps, cfg,
         key=key,
+        i2v_cond=i2v_cond,
         use_cfg=use_cfg,
     )
     jax.block_until_ready(result)

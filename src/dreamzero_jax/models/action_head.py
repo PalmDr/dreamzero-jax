@@ -438,11 +438,12 @@ class CausalWanDiT(nnx.Module):
         timestep_action: jax.Array | None = None,
         clean_x: jax.Array | None = None,
         clip_emb: jax.Array | None = None,
+        y: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """Joint video + action forward pass.
 
         Args:
-            x: Noisy video latent ``(B, T, H, W, C)``.
+            x: Noisy video latent ``(B, T, H, W, C)`` where C=16.
             timestep: Video diffusion timestep ``(B,)``.
             context: Text embeddings ``(B, L, text_dim)``.
             state: Robot state ``(B, num_blocks, state_dim)``.
@@ -454,6 +455,9 @@ class CausalWanDiT(nnx.Module):
             clean_x: Clean video for teacher forcing ``(B, T, H, W, C)``
                 or ``None``.
             clip_emb: CLIP image features ``(B, 257, 1280)`` or ``None``.
+            y: I2V conditioning ``(B, T, H, W, 20)`` — 4ch mask + 16ch
+                first-frame VAE latent. Concatenated with ``x`` (and
+                ``clean_x``) along channels before patch embedding.
 
         Returns:
             ``(video_noise_pred, action_noise_pred)`` where
@@ -465,6 +469,10 @@ class CausalWanDiT(nnx.Module):
             timestep_action = timestep
         has_clean = clean_x is not None
         B = x.shape[0]
+
+        # --- I2V conditioning: concat y along channel axis ---
+        if y is not None:
+            x = jnp.concatenate([x, y], axis=-1)
 
         # --- Patch embed noisy video ---
         x_patched = self.patch_embedding.proj(x)  # (B, f, h, w, dim)
@@ -499,6 +507,8 @@ class CausalWanDiT(nnx.Module):
 
         # --- Teacher forcing: prepend clean video ---
         if has_clean:
+            if y is not None:
+                clean_x = jnp.concatenate([clean_x, y], axis=-1)
             clean_patched = self.patch_embedding.proj(clean_x)
             clean_flat = clean_patched.reshape(B, f * h * w, self.dim)
             full_seq = jnp.concatenate([clean_flat, noisy_seq], axis=1)
