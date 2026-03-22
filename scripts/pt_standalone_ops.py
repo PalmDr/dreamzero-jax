@@ -47,13 +47,17 @@ def load_sharded_safetensors(ckpt_dir: Path) -> dict[str, np.ndarray]:
     else:
         shard_files = sorted(p.name for p in ckpt_dir.glob("*.safetensors"))
 
+    import torch
     weights: dict[str, np.ndarray] = {}
     for shard_name in shard_files:
         shard_path = ckpt_dir / shard_name
+        if not shard_path.exists():
+            print(f"  Skipping {shard_name} (not found)")
+            continue
         print(f"  Loading {shard_name}...")
-        with safe_open(str(shard_path), framework="numpy") as f:
+        with safe_open(str(shard_path), framework="pt") as f:
             for key in f.keys():
-                weights[key] = f.get_tensor(key)
+                weights[key] = f.get_tensor(key).float().numpy()
     return weights
 
 
