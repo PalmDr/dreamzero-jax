@@ -13,7 +13,7 @@ A from-scratch JAX/Flax NNX port of [NVIDIA's DreamZero](https://github.com/drea
 Five commands from zero to inference:
 
 ```bash
-git clone https://github.com/ironleaf-ai/dreamzero-jax
+git clone https://github.com/PalmDr/dreamzero-jax
 cd dreamzero-jax
 uv sync
 
@@ -41,7 +41,7 @@ gcloud compute tpus tpu-vm create dreamzero \
 ### Install
 
 ```bash
-git clone https://github.com/ironleaf-ai/dreamzero-jax
+git clone https://github.com/PalmDr/dreamzero-jax
 cd dreamzero-jax
 pip install uv && uv pip install -e '.[tpu]'
 ```

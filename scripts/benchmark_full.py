@@ -41,6 +41,7 @@ from dreamzero_jax.models.dreamzero import DreamZeroConfig
 from dreamzero_jax.nn.embed import PatchEmbed3D, WanRoPE3D, sinusoidal_embedding
 from dreamzero_jax.nn.mlp import MLP
 from dreamzero_jax.schedulers.flow_euler import make_flow_euler_schedule, euler_step
+from dreamzero_jax.utils.sharding import create_mesh, shard_params
 
 # ---------------------------------------------------------------------------
 # Hardware constants
@@ -67,7 +68,6 @@ CONFIG_14B = dict(
     out_channels=16,
     has_image_input=True,
     image_dim=1280,
-    image_out_dim=1024,
     cross_attn_norm=True,
     action_dim=32,
     state_dim=64,
@@ -301,7 +301,8 @@ def make_dit_inputs(
     timestep = jnp.full((B,), 500.0)
     context = jax.random.normal(k2, (B, TEXT_SEQ_LEN, CONFIG_14B["text_dim"]), dtype=dtype)
 
-    num_blocks = GRID_F
+    # First frame is standalone; remaining frames form causal blocks
+    num_blocks = GRID_F - 1
     state = jax.random.normal(k3, (B, num_blocks, 64), dtype=jnp.float32)
     embodiment_id = jnp.zeros((B,), dtype=jnp.int32)
 
@@ -326,7 +327,7 @@ def make_denoise_inputs(
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
 
-    num_blocks = GRID_F
+    num_blocks = GRID_F - 1
     total_actions = num_blocks * 32
     config = DreamZeroConfig(
         **CONFIG_14B,
@@ -451,6 +452,7 @@ def bench_full_generation(
 def bench_throughput(
     num_layers: int, dtype: jnp.dtype,
     batch_sizes: list[int], warmup: int, iters: int,
+    mesh=None,
 ) -> list[ThroughputResult]:
     results = []
     for bs in batch_sizes:
@@ -462,6 +464,9 @@ def bench_throughput(
             cpu = jax.devices("cpu")[0]
             with jax.default_device(cpu):
                 dit = make_dit(num_layers, dtype)
+            if mesh is not None:
+                with mesh:
+                    dit = shard_params(dit, mesh, param_dtype=dtype)
             inputs = make_dit_inputs(bs, dtype, num_layers)
 
             @nnx.jit
@@ -765,6 +770,10 @@ def run_all(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
 
+    # --- Create mesh for sharding ---
+    mesh = create_mesh()
+    print(f"  Mesh:        {mesh.shape}")
+
     # --- Create model ---
     print("\n  Creating CausalWanDiT on CPU...")
     cpu = jax.devices("cpu")[0]
@@ -774,6 +783,11 @@ def run_all(args: argparse.Namespace) -> dict[str, Any]:
     n_params = count_params(dit)
     w_mem = weight_memory_gb(dit)
     print(f"  Parameters:  {n_params:,} ({w_mem:.2f} GB)")
+
+    print("  Sharding model across mesh...")
+    with mesh:
+        dit = shard_params(dit, mesh, param_dtype=dtype)
+    print("  Sharding complete.")
 
     # --- 3. Memory ---
     print_header("3. Memory Analysis")
@@ -845,6 +859,7 @@ def run_all(args: argparse.Namespace) -> dict[str, Any]:
         print_header("2. Throughput Sweep")
         tp_results = bench_throughput(
             num_layers, dtype, batch_sizes, args.warmup, args.iters,
+            mesh=mesh,
         )
         print()
         print_throughput_table(tp_results)
