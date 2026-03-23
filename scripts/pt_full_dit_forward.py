@@ -98,7 +98,7 @@ def load_selective_weights(ckpt_dir: Path, needed_prefixes: list[str]) -> dict[s
             available = set(f.keys())
             for key in keys_in_shard:
                 if key in available:
-                    weights[key] = f.get_tensor(key).float().numpy()
+                    weights[key] = f.get_tensor(key).float().detach().cpu().numpy()
     return weights
 
 
@@ -969,7 +969,7 @@ def causal_wan_dit_forward(
     seq_len = f * h * w
     frame_seqlen = h * w
     x_flat = x_patched.reshape(B, seq_len, DROID_DIM)
-    intermediates["inter_patched_video"] = x_flat.numpy().copy()
+    intermediates["inter_patched_video"] = x_flat.detach().cpu().numpy().copy()
 
     freqs = create_video_freqs(DROID_HEAD_DIM, f, h, w)
     freqs_action = rope_params_polar(1024 * 10, DROID_HEAD_DIM)
@@ -1012,14 +1012,14 @@ def causal_wan_dit_forward(
     total_L = full_seq.shape[1]
     e_tokens = e_flat.reshape(B, total_L, DROID_DIM)
     e0_tokens = e0_flat.reshape(B, total_L, 6, DROID_DIM)
-    intermediates["inter_e_tokens"] = e_tokens.numpy().copy()
+    intermediates["inter_e_tokens"] = e_tokens.detach().cpu().numpy().copy()
 
     ctx = text_conditioning(context, weights)
     has_img_weights = has_weight(weights, "model.img_emb.proj.0.weight")
     if clip_emb is not None and has_img_weights:
         ctx = torch.cat([img_emb_forward(clip_emb, weights), ctx], dim=1)
 
-    intermediates["inter_seq_pre_block"] = full_seq.numpy().copy()
+    intermediates["inter_seq_pre_block"] = full_seq.detach().cpu().numpy().copy()
 
     is_tf = has_clean
 
@@ -1033,7 +1033,7 @@ def causal_wan_dit_forward(
             use_i2v_ca=has_img_weights, is_tf=is_tf)
         print(f" {time.time() - t0:.1f}s")
         if i == 0:
-            intermediates["inter_seq_post_block0"] = full_seq.numpy().copy()
+            intermediates["inter_seq_post_block0"] = full_seq.detach().cpu().numpy().copy()
         offset_blk = seq_len if has_clean else 0
         act_slice = full_seq[:, offset_blk + seq_len:offset_blk + seq_len + action_length]
         _nan_check(f"block {i} action tokens", act_slice)
@@ -1044,7 +1044,7 @@ def causal_wan_dit_forward(
     video_pred = full_seq[:, :seq_len]
     action_pred = full_seq[:, seq_len:seq_len + action_length]
     _nan_check("action_pred (extracted)", action_pred)
-    intermediates["inter_action_pre_decode"] = action_pred.numpy().copy()
+    intermediates["inter_action_pre_decode"] = action_pred.detach().cpu().numpy().copy()
 
     offset = seq_len if has_clean else 0
     e_video = e_tokens[:, offset:offset + seq_len]
@@ -1141,23 +1141,23 @@ def print_input_shapes(inputs):
 def save_results(video_pred, action_pred, inputs, intermediates, output_path):
     """Save forward pass results + all inputs + intermediates to .npz file."""
     results = {
-        "video_noise_pred": video_pred.numpy(),
-        "action_noise_pred": action_pred.numpy(),
-        "input_x": inputs["x"].numpy(),
-        "input_timestep": inputs["timestep"].numpy(),
-        "input_actions": inputs["actions"].numpy(),
-        "input_state": inputs["state"].numpy(),
-        "input_timestep_action": inputs["timestep_action"].numpy(),
-        "input_embodiment_id": inputs["embodiment_id"].numpy(),
+        "video_noise_pred": video_pred.detach().cpu().numpy(),
+        "action_noise_pred": action_pred.detach().cpu().numpy(),
+        "input_x": inputs["x"].detach().cpu().numpy(),
+        "input_timestep": inputs["timestep"].detach().cpu().numpy(),
+        "input_actions": inputs["actions"].detach().cpu().numpy(),
+        "input_state": inputs["state"].detach().cpu().numpy(),
+        "input_timestep_action": inputs["timestep_action"].detach().cpu().numpy(),
+        "input_embodiment_id": inputs["embodiment_id"].detach().cpu().numpy(),
     }
     if inputs.get("context") is not None:
-        results["input_context"] = inputs["context"].numpy()
+        results["input_context"] = inputs["context"].detach().cpu().numpy()
     if inputs.get("clip_emb") is not None:
-        results["input_clip_emb"] = inputs["clip_emb"].numpy()
+        results["input_clip_emb"] = inputs["clip_emb"].detach().cpu().numpy()
     if inputs.get("clean_x") is not None:
-        results["input_clean_x"] = inputs["clean_x"].numpy()
+        results["input_clean_x"] = inputs["clean_x"].detach().cpu().numpy()
     if inputs.get("y") is not None:
-        results["input_y"] = inputs["y"].numpy()
+        results["input_y"] = inputs["y"].detach().cpu().numpy()
     results.update(intermediates)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(str(output_path), **results)
