@@ -132,7 +132,10 @@ def get_weight(weights: dict[str, np.ndarray], key: str):
     if key not in weights:
         raise KeyError(f"Weight '{key}' not found in checkpoint. "
                        f"The shard containing this weight may be missing.")
-    return torch.from_numpy(weights[key].copy()).float()
+    val = weights[key]
+    if isinstance(val, np.ndarray):
+        return torch.from_numpy(val.copy()).float()
+    return val.float()
 
 
 # ---------------------------------------------------------------------------

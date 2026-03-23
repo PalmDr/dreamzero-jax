@@ -63,7 +63,7 @@ CONFIG_14B = dict(
     freq_dim=256,
     text_dim=4096,
     patch_size=(1, 2, 2),
-    in_channels=16,
+    in_channels=36,
     out_channels=16,
     has_image_input=True,
 )
@@ -291,9 +291,7 @@ def make_dit_inputs(
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
 
-    # in_channels=16 for video, +20 for i2v_cond (mask 4ch + latent 16ch) = 36
-    in_ch = CONFIG_14B["in_channels"] + 20
-    x = jax.random.normal(k1, (B, LATENT_T, LATENT_H, LATENT_W, in_ch), dtype=dtype)
+    x = jax.random.normal(k1, (B, LATENT_T, LATENT_H, LATENT_W, LATENT_C), dtype=dtype)
     timestep = jnp.full((B,), 500.0)
     context = jax.random.normal(k2, (B, TEXT_SEQ_LEN, CONFIG_14B["text_dim"]), dtype=dtype)
 
@@ -395,7 +393,6 @@ def bench_full_generation(
     config = denoise_inputs["config"]
     B = denoise_inputs["noisy_video"].shape[0]
 
-    # Concatenate i2v_cond channel to video for CausalWanDiT
     y = denoise_inputs["y"]
 
     @nnx.jit
@@ -414,10 +411,9 @@ def bench_full_generation(
             tv_b = jnp.broadcast_to(tv, (B,))
             ta_b = jnp.broadcast_to(ta, (B,))
 
-            x_in = jnp.concatenate([nv, y_cond], axis=-1)
             vp, ap = model(
-                x_in, tv_b, p_emb, st, eid, na,
-                timestep_action=ta_b, clip_emb=c_emb, y=None,
+                nv, tv_b, p_emb, st, eid, na,
+                timestep_action=ta_b, clip_emb=c_emb, y=y_cond,
             )
             nv_next = euler_step(vp, nv, sv, svn)
             na_next = euler_step(ap, na, sa, san)
@@ -574,23 +570,21 @@ def bench_components_breakdown(
     dtype = inputs["x"].dtype
     dim = CONFIG_14B["dim"]
 
-    # Patch embedding
-    def _patch_embed():
-        return dit.patch_embedding.proj(inputs["x"])
+    x_cat = jnp.concatenate([inputs["x"], inputs["y"]], axis=-1)
 
-    # Time embedding
+    def _patch_embed():
+        return dit.patch_embedding.proj(x_cat)
+
     def _time_embed():
         t = sinusoidal_embedding(inputs["timestep"], dit.freq_dim)
         t = dit.time_embedding(t)
         e = jax.nn.silu(t)
         return dit.time_projection(e)
 
-    # Text embedding
     def _text_embed():
         return dit.text_embedding(inputs["context"])
 
-    # Single block (self_attn + cross_attn + ffn)
-    x_patched = dit.patch_embedding.proj(inputs["x"])
+    x_patched = dit.patch_embedding.proj(x_cat)
     _, f, h, w, _ = x_patched.shape
     x_flat = x_patched.reshape(B, f * h * w, dim)
 
