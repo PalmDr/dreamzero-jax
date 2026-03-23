@@ -66,6 +66,12 @@ CONFIG_14B = dict(
     in_channels=36,
     out_channels=16,
     has_image_input=True,
+    image_dim=1280,
+    image_out_dim=1024,
+    cross_attn_norm=True,
+    action_dim=32,
+    state_dim=64,
+    max_num_embodiments=1,
 )
 
 LATENT_T = 9
