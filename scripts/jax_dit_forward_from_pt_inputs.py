@@ -57,13 +57,11 @@ def main():
     )
 
     cpu = jax.devices("cpu")[0]
-    print("Loading checkpoint...")
-    raw = load_checkpoint_auto(args.checkpoint_dir)
-    converted = convert_checkpoint(raw, cfg)
-    del raw
-
-    print("Creating DiT on CPU...")
+    print("Loading checkpoint + creating DiT on CPU...")
     with jax.default_device(cpu):
+        raw = load_checkpoint_auto(args.checkpoint_dir)
+        converted = convert_checkpoint(raw, cfg)
+        del raw
         dit = CausalWanDiT(
             dim=cfg.dim, in_channels=cfg.in_channels, out_channels=cfg.out_channels,
             ffn_dim=cfg.ffn_dim, freq_dim=cfg.freq_dim, text_dim=cfg.text_dim,
@@ -90,11 +88,8 @@ def main():
         print(f"  {applied} applied, {len(missing)} missing")
     del converted, dit_keys
 
-    mesh = create_mesh()
-    dit = shard_params(dit, mesh, param_dtype=cfg.param_dtype)
-
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    rep = NamedSharding(mesh, P())
+    # Skip sharding — PT uses small tensors that don't divide by 4 chips
+    rep = jax.sharding.SingleDeviceSharding(jax.devices()[0])
 
     # PT standalone uses torch.manual_seed(42) to generate inputs sequentially.
     # Reconstruct the EXACT same sequence here.
@@ -132,8 +127,8 @@ def main():
     has_nan = np.any(np.isnan(vid_np)) or np.any(np.isnan(act_np))
 
     print(f"Done in {elapsed:.1f}s")
-    print(f"  video: {vid_np.shape} mean={vid_np.mean():.6f} std={vid_np.std():.6f}")
-    print(f"  action: {act_np.shape} mean={act_np.mean():.6f} std={act_np.std():.6f}")
+    print(f"  video: {vid_np.shape} mean={float(np.nanmean(vid_np)):.6f} std={float(np.nanstd(vid_np)):.6f}")
+    print(f"  action: {act_np.shape} mean={float(np.nanmean(act_np)):.6f} std={float(np.nanstd(act_np)):.6f}")
     print(f"  NaN: {has_nan}")
 
     pt_vid = pt["video_noise_pred"]
