@@ -98,7 +98,7 @@ class CategorySpecificMLP(nnx.Module):
         )
 
     def __call__(self, x: jax.Array, category_ids: jax.Array) -> jax.Array:
-        return self.linear2(jax.nn.silu(self.linear1(x, category_ids)), category_ids)
+        return self.linear2(jax.nn.relu(self.linear1(x, category_ids)), category_ids)
 
 
 class MultiEmbodimentActionEncoder(nnx.Module):
@@ -151,12 +151,18 @@ class MultiEmbodimentActionEncoder(nnx.Module):
             ``(B, T, hidden_size)`` action embeddings.
         """
         B, T, _ = actions.shape
-        a_emb = self.W1(actions, category_ids)  # (B, T, H)
-        tau_emb = sinusoidal_embedding(timesteps, self.hidden_size)  # (B, H)
-        tau_emb = jnp.broadcast_to(tau_emb[:, None, :], (B, T, self.hidden_size))
-        x = jnp.concatenate([a_emb, tau_emb], axis=-1)  # (B, T, 2H)
-        x = jax.nn.silu(self.W2(x, category_ids))  # (B, T, H)
-        return self.W3(x, category_ids)  # (B, T, H)
+        a_emb = self.W1(actions, category_ids)
+        # Original uses SinusoidalPositionalEncoding with [sin, cos] order
+        # and (B, T) input (timestep broadcast across T action steps)
+        ts_expanded = jnp.broadcast_to(timesteps[:, None], (B, T))
+        half = self.hidden_size // 2
+        exponent = -jnp.log(10000.0) * jnp.arange(half) / half
+        freqs = ts_expanded[..., None] * jnp.exp(exponent)
+        tau_emb = jnp.concatenate([jnp.sin(freqs), jnp.cos(freqs)], axis=-1)
+        tau_emb = tau_emb.astype(a_emb.dtype)
+        x = jnp.concatenate([a_emb, tau_emb], axis=-1)
+        x = jax.nn.silu(self.W2(x, category_ids))
+        return self.W3(x, category_ids)
 
 
 # ---------------------------------------------------------------------------

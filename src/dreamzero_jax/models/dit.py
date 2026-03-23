@@ -88,7 +88,7 @@ class MLPProj(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.norm_in(x)
-        x = _gelu_approx(self.linear1(x))
+        x = jax.nn.gelu(self.linear1(x), approximate=False)
         x = self.linear2(x)
         return self.norm_out(x)
 
