@@ -952,7 +952,10 @@ def causal_wan_dit_forward(
     Sequence layout: [video | action | state] (appended, not interleaved).
     With teacher forcing: [clean_video | noisy_video | action | state].
     Per-token time conditioning.
+
+    Returns (video_noise_pred, action_noise_pred, intermediates_dict).
     """
+    intermediates = {}
     has_clean = clean_x is not None
     B = x.shape[0]
 
@@ -963,6 +966,7 @@ def causal_wan_dit_forward(
     seq_len = f * h * w
     frame_seqlen = h * w
     x_flat = x_patched.reshape(B, seq_len, DROID_DIM)
+    intermediates["inter_patched_video"] = x_flat.numpy().copy()
 
     freqs = create_video_freqs(DROID_HEAD_DIM, f, h, w)
     freqs_action = rope_params_polar(1024 * 10, DROID_HEAD_DIM)
@@ -1005,11 +1009,14 @@ def causal_wan_dit_forward(
     total_L = full_seq.shape[1]
     e_tokens = e_flat.reshape(B, total_L, DROID_DIM)
     e0_tokens = e0_flat.reshape(B, total_L, 6, DROID_DIM)
+    intermediates["inter_e_tokens"] = e_tokens.numpy().copy()
 
     ctx = text_conditioning(context, weights)
     has_img_weights = has_weight(weights, "model.img_emb.proj.0.weight")
     if clip_emb is not None and has_img_weights:
         ctx = torch.cat([img_emb_forward(clip_emb, weights), ctx], dim=1)
+
+    intermediates["inter_seq_pre_block"] = full_seq.numpy().copy()
 
     is_tf = has_clean
 
@@ -1022,6 +1029,8 @@ def causal_wan_dit_forward(
             action_register_length, frame_seqlen,
             use_i2v_ca=has_img_weights, is_tf=is_tf)
         print(f" {time.time() - t0:.1f}s")
+        if i == 0:
+            intermediates["inter_seq_post_block0"] = full_seq.numpy().copy()
         offset_blk = seq_len if has_clean else 0
         act_slice = full_seq[:, offset_blk + seq_len:offset_blk + seq_len + action_length]
         _nan_check(f"block {i} action tokens", act_slice)
@@ -1032,6 +1041,7 @@ def causal_wan_dit_forward(
     video_pred = full_seq[:, :seq_len]
     action_pred = full_seq[:, seq_len:seq_len + action_length]
     _nan_check("action_pred (extracted)", action_pred)
+    intermediates["inter_action_pre_decode"] = action_pred.numpy().copy()
 
     offset = seq_len if has_clean else 0
     e_video = e_tokens[:, offset:offset + seq_len]
@@ -1040,7 +1050,7 @@ def causal_wan_dit_forward(
 
     action_noise_pred = action_decoder_forward(action_pred, embodiment_id, weights)
     _nan_check("action_noise_pred (decoded)", action_noise_pred)
-    return video_noise_pred, action_noise_pred
+    return video_noise_pred, action_noise_pred, intermediates
 
 
 # ---------------------------------------------------------------------------
@@ -1125,8 +1135,8 @@ def print_input_shapes(inputs):
     print(f"  timestep:     {inputs['timestep'].item()}")
 
 
-def save_results(video_pred, action_pred, inputs, output_path):
-    """Save forward pass results to .npz file."""
+def save_results(video_pred, action_pred, inputs, intermediates, output_path):
+    """Save forward pass results + all inputs + intermediates to .npz file."""
     results = {
         "video_noise_pred": video_pred.numpy(),
         "action_noise_pred": action_pred.numpy(),
@@ -1134,7 +1144,18 @@ def save_results(video_pred, action_pred, inputs, output_path):
         "input_timestep": inputs["timestep"].numpy(),
         "input_actions": inputs["actions"].numpy(),
         "input_state": inputs["state"].numpy(),
+        "input_timestep_action": inputs["timestep_action"].numpy(),
+        "input_embodiment_id": inputs["embodiment_id"].numpy(),
     }
+    if inputs.get("context") is not None:
+        results["input_context"] = inputs["context"].numpy()
+    if inputs.get("clip_emb") is not None:
+        results["input_clip_emb"] = inputs["clip_emb"].numpy()
+    if inputs.get("clean_x") is not None:
+        results["input_clean_x"] = inputs["clean_x"].numpy()
+    if inputs.get("y") is not None:
+        results["input_y"] = inputs["y"].numpy()
+    results.update(intermediates)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(str(output_path), **results)
     return results
@@ -1159,18 +1180,18 @@ def load_and_validate_weights(args):
 
 
 def run_forward(inputs, weights, num_layers):
-    """Run the forward pass and return (video_pred, action_pred, elapsed)."""
+    """Run the forward pass and return (video_pred, action_pred, intermediates, elapsed)."""
     print(f"\nRunning forward pass ({num_layers} layers)...")
     t1 = time.time()
     with torch.no_grad():
-        video_pred, action_pred = causal_wan_dit_forward(
+        video_pred, action_pred, intermediates = causal_wan_dit_forward(
             x=inputs["x"], timestep=inputs["timestep"], context=inputs["context"],
             state=inputs["state"], embodiment_id=inputs["embodiment_id"],
             actions=inputs["actions"], timestep_action=inputs["timestep_action"],
             clean_x=inputs["clean_x"], clip_emb=inputs["clip_emb"],
             y=inputs["y"], weights=weights, num_layers=num_layers,
         )
-    return video_pred, action_pred, time.time() - t1
+    return video_pred, action_pred, intermediates, time.time() - t1
 
 
 def main():
@@ -1197,7 +1218,7 @@ def main():
         inputs["clip_emb"] = None
     print_input_shapes(inputs)
 
-    video_pred, action_pred, elapsed = run_forward(inputs, weights, num_layers)
+    video_pred, action_pred, intermediates, elapsed = run_forward(inputs, weights, num_layers)
 
     print(f"\n  video_noise_pred:  {tuple(video_pred.shape)}  "
           f"mean={video_pred.mean():.6f}  std={video_pred.std():.6f}")
@@ -1207,8 +1228,9 @@ def main():
     if has_nan:
         print("  WARNING: NaN detected!")
 
-    results = save_results(video_pred, action_pred, inputs, Path(args.output))
+    results = save_results(video_pred, action_pred, inputs, intermediates, Path(args.output))
     print(f"\n  Saved {len(results)} arrays to {args.output}")
+    print(f"  Intermediates: {[k for k in results if k.startswith('inter_')]}")
     print(f"  Forward: {elapsed:.1f}s  Total: {time.time() - t0:.1f}s  NaN: {'YES' if has_nan else 'no'}")
 
 
