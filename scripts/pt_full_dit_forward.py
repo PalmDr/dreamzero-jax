@@ -932,6 +932,17 @@ def text_conditioning(context, weights):
 # ---------------------------------------------------------------------------
 
 
+def _nan_check(label, tensor):
+    """Print NaN diagnostic for a tensor."""
+    n = torch.isnan(tensor).sum().item()
+    if n > 0:
+        print(f"  NaN CHECK [{label}]: {n}/{tensor.numel()} NaN  "
+              f"shape={tuple(tensor.shape)}")
+    else:
+        print(f"  NaN CHECK [{label}]: OK  "
+              f"mean={tensor.mean():.4f} std={tensor.std():.4f}")
+
+
 def causal_wan_dit_forward(
     x, timestep, context, state, embodiment_id, actions,
     timestep_action, clean_x, clip_emb, y, weights, num_layers,
@@ -958,12 +969,15 @@ def causal_wan_dit_forward(
     freqs_state = rope_params_polar(1024, DROID_HEAD_DIM)
 
     action_emb = action_encoder_forward(actions, timestep_action, embodiment_id, weights)
+    _nan_check("action_emb", action_emb)
     state_emb = state_encoder_forward(state, embodiment_id, weights)
+    _nan_check("state_emb", state_emb)
 
     action_register = torch.cat([action_emb, state_emb], dim=1)
     action_length = action_emb.shape[1]
     action_register_length = action_register.shape[1]
     x_seq = torch.cat([x_flat, action_register], dim=1)
+    _nan_check("x_seq (video+action+state)", x_seq)
 
     if has_clean:
         if y is not None:
@@ -1008,12 +1022,16 @@ def causal_wan_dit_forward(
             action_register_length, frame_seqlen,
             use_i2v_ca=has_img_weights, is_tf=is_tf)
         print(f" {time.time() - t0:.1f}s")
+        offset_blk = seq_len if has_clean else 0
+        act_slice = full_seq[:, offset_blk + seq_len:offset_blk + seq_len + action_length]
+        _nan_check(f"block {i} action tokens", act_slice)
 
     if has_clean:
         full_seq = full_seq[:, seq_len:]
 
     video_pred = full_seq[:, :seq_len]
     action_pred = full_seq[:, seq_len:seq_len + action_length]
+    _nan_check("action_pred (extracted)", action_pred)
 
     offset = seq_len if has_clean else 0
     e_video = e_tokens[:, offset:offset + seq_len]
@@ -1021,6 +1039,7 @@ def causal_wan_dit_forward(
     video_noise_pred = unpatchify_pt(video_out, (f, h, w), PATCH_SIZE, OUT_CHANNELS)
 
     action_noise_pred = action_decoder_forward(action_pred, embodiment_id, weights)
+    _nan_check("action_noise_pred (decoded)", action_noise_pred)
     return video_noise_pred, action_noise_pred
 
 
@@ -1033,7 +1052,10 @@ def make_test_inputs(num_blocks=2, h_patches=4, w_patches=4, text_len=16):
     """Create deterministic test inputs for the forward pass."""
     torch.manual_seed(SEED)
 
-    f = num_blocks * NUM_FRAMES_PER_BLOCK
+    # +1 because the first frame is the context/conditioning frame
+    # (self-attention only, no associated action/state tokens).
+    # The remaining num_blocks frames each pair with action/state tokens.
+    f = (num_blocks + 1) * NUM_FRAMES_PER_BLOCK
     H = h_patches * PATCH_SIZE[1]
     W = w_patches * PATCH_SIZE[2]
     B = 1
