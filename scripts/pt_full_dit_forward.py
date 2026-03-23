@@ -971,9 +971,10 @@ def causal_wan_dit_forward(
     x_flat = x_patched.reshape(B, seq_len, DROID_DIM)
     intermediates["inter_patched_video"] = x_flat.detach().cpu().numpy().copy()
 
-    freqs = create_video_freqs(DROID_HEAD_DIM, f, h, w)
-    freqs_action = rope_params_polar(1024 * 10, DROID_HEAD_DIM)
-    freqs_state = rope_params_polar(1024, DROID_HEAD_DIM)
+    device = x.device
+    freqs = create_video_freqs(DROID_HEAD_DIM, f, h, w).to(device)
+    freqs_action = rope_params_polar(1024 * 10, DROID_HEAD_DIM).to(device)
+    freqs_state = rope_params_polar(1024, DROID_HEAD_DIM).to(device)
 
     action_emb = action_encoder_forward(actions, timestep_action, embodiment_id, weights)
     _nan_check("action_emb", action_emb)
