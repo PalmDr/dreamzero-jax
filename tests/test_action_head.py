@@ -23,15 +23,16 @@ STATE_DIM = 14
 ACTION_HIDDEN = 64
 BATCH = 2
 NUM_CATS = 4  # small number of embodiments
-# Video: 2 frames, 8x8 spatial, 16 latent channels
-# Patch (1,2,2) -> f=2, h=4, w=4, frame_seqlen=16
-NUM_FRAMES = 2
+# Video: 3 frames, 8x8 spatial, 16 latent channels
+# Patch (1,2,2) -> f=3, h=4, w=4, frame_seqlen=16
+# First frame is conditioning; remaining NUM_BLOCKS frames pair with action/state.
+NUM_BLOCKS = 2
+FRAMES_PER_BLOCK = 1
+NUM_FRAMES = (NUM_BLOCKS + 1) * FRAMES_PER_BLOCK  # 3
 IMAGE_H = 8
 IMAGE_W = 8
 IN_CHANNELS = 16
 PATCH_SIZE = (1, 2, 2)
-FRAMES_PER_BLOCK = 1
-NUM_BLOCKS = NUM_FRAMES // FRAMES_PER_BLOCK  # 2
 NUM_ACTION_PER_BLOCK = 4
 NUM_STATE_PER_BLOCK = 1
 FRAME_SEQLEN = (IMAGE_H // PATCH_SIZE[1]) * (IMAGE_W // PATCH_SIZE[2])  # 16

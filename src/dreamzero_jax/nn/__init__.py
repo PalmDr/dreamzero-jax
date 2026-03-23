@@ -13,6 +13,7 @@ from dreamzero_jax.nn.embed import (
     precompute_freqs_cis,
     precompute_freqs_cis_3d,
     apply_rotary_emb,
+    rope_params_polar_1d,
 )
 from dreamzero_jax.nn.attention import Attention, make_causal_mask, make_causal_chunk_mask
 from dreamzero_jax.nn.pallas_ops import fused_adaln_modulate
@@ -32,6 +33,7 @@ __all__ = [
     "precompute_freqs_cis",
     "precompute_freqs_cis_3d",
     "apply_rotary_emb",
+    "rope_params_polar_1d",
     "Attention",
     "make_causal_mask",
     "make_causal_chunk_mask",

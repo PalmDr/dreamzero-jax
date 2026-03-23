@@ -1,5 +1,7 @@
 """Attention mechanisms for DreamZero."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
@@ -295,3 +297,244 @@ class Attention(nnx.Module):
         # Merge heads: (B, q_len, num_heads, head_dim) -> (B, q_len, inner_dim)
         out = out.reshape(B, q_len, self.num_heads * self.head_dim)
         return self.out_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Blockwise causal attention for CausalWanDiT
+# ---------------------------------------------------------------------------
+
+
+def _sdpa(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+    """Scaled dot-product attention on (B, L, H, D) tensors."""
+    return jax.nn.dot_product_attention(q, k, v)
+
+
+def _causal_sdpa(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+    """Causal (lower-triangular) scaled dot-product attention.
+
+    Supports asymmetric Q/K lengths: mask is lower-triangular with
+    diagonal offset ``L_k - L_q`` so the last query attends to all keys.
+    """
+    L_q = q.shape[1]
+    L_k = k.shape[1]
+    offset = L_k - L_q
+    mask = jnp.tril(jnp.ones((L_q, L_k), dtype=jnp.bool_), k=offset)
+    bias = jnp.where(mask, 0.0, jnp.finfo(q.dtype).min)[None, None, :, :]
+    return jax.nn.dot_product_attention(q, k, v, bias=bias)
+
+
+def blockwise_causal_attn(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    frame_seqlen: int,
+    num_frame_per_block: int,
+    action_horizon: int,
+    state_horizon: int,
+    num_action_per_block: int,
+    num_state_per_block: int,
+) -> jax.Array:
+    """Procedural block-wise causal attention (inference / no teacher forcing).
+
+    Sequence layout: ``[first_image | image_blocks | action_tokens | state_tokens]``
+
+    All inputs are ``(B, total_len, num_heads, head_dim)`` with RoPE already
+    applied to Q and K.
+    """
+    total_len = q.shape[1]
+    first_image_len = frame_seqlen
+    image_blocks_len = total_len - first_image_len - action_horizon - state_horizon
+    num_image_blocks = image_blocks_len // (num_frame_per_block * frame_seqlen)
+    block_size = num_frame_per_block * frame_seqlen
+
+    image_blocks_start = first_image_len
+    action_start = image_blocks_start + image_blocks_len
+    state_start = action_start + action_horizon
+
+    parts_out = []
+
+    parts_out.append(
+        _sdpa(q[:, :first_image_len], k[:, :first_image_len], v[:, :first_image_len])
+    )
+
+    img_block_parts = []
+    for bi in range(num_image_blocks):
+        blk_s = image_blocks_start + bi * block_size
+        blk_e = image_blocks_start + (bi + 1) * block_size
+        a_s = action_start + bi * num_action_per_block
+        a_e = action_start + (bi + 1) * num_action_per_block
+        s_s = state_start + bi * num_state_per_block
+        s_e = state_start + (bi + 1) * num_state_per_block
+
+        k_ctx = jnp.concatenate([
+            k[:, :first_image_len],
+            k[:, image_blocks_start:blk_e],
+            k[:, a_s:a_e],
+            k[:, s_s:s_e],
+        ], axis=1)
+        v_ctx = jnp.concatenate([
+            v[:, :first_image_len],
+            v[:, image_blocks_start:blk_e],
+            v[:, a_s:a_e],
+            v[:, s_s:s_e],
+        ], axis=1)
+        img_block_parts.append(_sdpa(q[:, blk_s:blk_e], k_ctx, v_ctx))
+    if img_block_parts:
+        parts_out.append(jnp.concatenate(img_block_parts, axis=1))
+
+    act_parts = []
+    for bi in range(num_image_blocks):
+        a_s = action_start + bi * num_action_per_block
+        a_e = action_start + (bi + 1) * num_action_per_block
+        img_end = image_blocks_start + (bi + 1) * block_size
+        s_s = state_start + bi * num_state_per_block
+        s_e = state_start + (bi + 1) * num_state_per_block
+
+        k_ctx = jnp.concatenate([
+            k[:, :first_image_len],
+            k[:, image_blocks_start:img_end],
+            k[:, a_s:a_e],
+            k[:, s_s:s_e],
+        ], axis=1)
+        v_ctx = jnp.concatenate([
+            v[:, :first_image_len],
+            v[:, image_blocks_start:img_end],
+            v[:, a_s:a_e],
+            v[:, s_s:s_e],
+        ], axis=1)
+        act_parts.append(_sdpa(q[:, a_s:a_e], k_ctx, v_ctx))
+    if act_parts:
+        parts_out.append(jnp.concatenate(act_parts, axis=1))
+
+    state_parts = []
+    for bi in range(state_horizon // max(num_state_per_block, 1)):
+        s_s = state_start + bi * num_state_per_block
+        s_e = state_start + (bi + 1) * num_state_per_block
+        state_parts.append(_sdpa(q[:, s_s:s_e], k[:, s_s:s_e], v[:, s_s:s_e]))
+    if state_parts:
+        parts_out.append(jnp.concatenate(state_parts, axis=1))
+
+    return jnp.concatenate(parts_out, axis=1)
+
+
+def blockwise_causal_attn_tf(
+    roped_q: jax.Array,
+    roped_k: jax.Array,
+    v: jax.Array,
+    frame_seqlen: int,
+    num_frame_per_block: int,
+    num_action_per_block: int,
+    num_state_per_block: int,
+    clean_image_seq_len: int,
+    noisy_image_seq_len: int,
+    action_horizon: int,
+    state_horizon: int,
+) -> jax.Array:
+    """Teacher-forcing blockwise causal attention.
+
+    Layout: ``[clean_video | noisy_video | action_tokens | state_tokens]``
+
+    All Q/K have RoPE already applied.  V is unmodified.
+    """
+    half = clean_image_seq_len
+
+    clean_q = roped_q[:, :half]
+    clean_k = roped_k[:, :half]
+    clean_v = v[:, :half]
+
+    noisy_img_q = roped_q[:, half:half + noisy_image_seq_len]
+    noisy_act_q = roped_q[:, half + noisy_image_seq_len:half + noisy_image_seq_len + action_horizon]
+    noisy_state_q = roped_q[:, half + noisy_image_seq_len + action_horizon:]
+
+    noisy_img_k = roped_k[:, half:half + noisy_image_seq_len]
+    noisy_act_k = roped_k[:, half + noisy_image_seq_len:half + noisy_image_seq_len + action_horizon]
+    noisy_state_k = roped_k[:, half + noisy_image_seq_len + action_horizon:]
+
+    noisy_img_v = v[:, half:half + noisy_image_seq_len]
+    noisy_act_v = v[:, half + noisy_image_seq_len:half + noisy_image_seq_len + action_horizon]
+    noisy_state_v = v[:, half + noisy_image_seq_len + action_horizon:]
+
+    clean_out = _causal_sdpa(clean_q, clean_k, clean_v)
+
+    noisy_frames = noisy_image_seq_len // frame_seqlen
+    num_blocks = (noisy_frames - 1) // num_frame_per_block
+    block_size = frame_seqlen * num_frame_per_block
+
+    noisy_img_parts = []
+    noisy_img_parts.append(
+        _sdpa(noisy_img_q[:, :frame_seqlen],
+              noisy_img_k[:, :frame_seqlen],
+              noisy_img_v[:, :frame_seqlen])
+    )
+
+    for bi in range(num_blocks):
+        ns = frame_seqlen + bi * block_size
+        ne = frame_seqlen + (bi + 1) * block_size
+        clean_end = frame_seqlen + bi * block_size
+        a_s = bi * num_action_per_block
+        a_e = (bi + 1) * num_action_per_block
+        s_s = bi * num_state_per_block
+        s_e = (bi + 1) * num_state_per_block
+
+        k_ctx = jnp.concatenate([
+            clean_k[:, :clean_end],
+            noisy_img_k[:, ns:ne],
+            noisy_act_k[:, a_s:a_e],
+            noisy_state_k[:, s_s:s_e],
+        ], axis=1)
+        v_ctx = jnp.concatenate([
+            clean_v[:, :clean_end],
+            noisy_img_v[:, ns:ne],
+            noisy_act_v[:, a_s:a_e],
+            noisy_state_v[:, s_s:s_e],
+        ], axis=1)
+        noisy_img_parts.append(_sdpa(noisy_img_q[:, ns:ne], k_ctx, v_ctx))
+    noisy_img_out = jnp.concatenate(noisy_img_parts, axis=1)
+
+    noisy_act_parts = []
+    for bi in range(num_blocks):
+        a_s = bi * num_action_per_block
+        a_e = (bi + 1) * num_action_per_block
+        clean_end = frame_seqlen + bi * block_size
+        ni_s = frame_seqlen + bi * block_size
+        ni_e = frame_seqlen + (bi + 1) * block_size
+        s_s = bi * num_state_per_block
+        s_e = (bi + 1) * num_state_per_block
+
+        k_ctx = jnp.concatenate([
+            clean_k[:, :clean_end],
+            noisy_img_k[:, ni_s:ni_e],
+            noisy_act_k[:, a_s:a_e],
+            noisy_state_k[:, s_s:s_e],
+        ], axis=1)
+        v_ctx = jnp.concatenate([
+            clean_v[:, :clean_end],
+            noisy_img_v[:, ni_s:ni_e],
+            noisy_act_v[:, a_s:a_e],
+            noisy_state_v[:, s_s:s_e],
+        ], axis=1)
+        noisy_act_parts.append(_sdpa(noisy_act_q[:, a_s:a_e], k_ctx, v_ctx))
+    noisy_act_out = (
+        jnp.concatenate(noisy_act_parts, axis=1)
+        if noisy_act_parts
+        else jnp.zeros_like(noisy_act_q[:, :0])
+    )
+
+    noisy_state_parts = []
+    for bi in range(state_horizon // max(num_state_per_block, 1)):
+        s_s = bi * num_state_per_block
+        s_e = (bi + 1) * num_state_per_block
+        noisy_state_parts.append(
+            _sdpa(noisy_state_q[:, s_s:s_e],
+                  noisy_state_k[:, s_s:s_e],
+                  noisy_state_v[:, s_s:s_e])
+        )
+    noisy_state_out = (
+        jnp.concatenate(noisy_state_parts, axis=1)
+        if noisy_state_parts
+        else jnp.zeros_like(noisy_state_q[:, :0])
+    )
+
+    return jnp.concatenate(
+        [clean_out, noisy_img_out, noisy_act_out, noisy_state_out], axis=1
+    )

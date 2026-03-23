@@ -4,7 +4,13 @@ Contains multi-embodiment action encoders/decoders and the causal
 action-aware DiT backbone (CausalWanDiT) for joint video + action
 prediction.
 
-Layout: ``(B, L, C)`` for all intermediate tensors.
+Sequence layout (appended, matching original DreamZero)::
+
+    [video_tokens | action_tokens | state_tokens]
+
+With teacher forcing::
+
+    [clean_video | noisy_video | action_tokens | state_tokens]
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from flax import nnx
 from dreamzero_jax.nn.embed import (
     PatchEmbed3D,
     WanRoPE3D,
+    rope_params_polar_1d,
     sinusoidal_embedding,
 )
 from dreamzero_jax.nn.mlp import MLP
@@ -25,9 +32,14 @@ from dreamzero_jax.models.dit import (
     MLPProj,
     WanDiTBlock,
     WanDiTHead,
-    _remat_blocks,
-    _scan_blocks,
     unpatchify,
+)
+from dreamzero_jax.models.causal_ops import (
+    causal_block_forward,
+    causal_remat_blocks,
+    causal_scan_blocks,
+    head_forward_per_token,
+    per_token_time_conditioning,
 )
 
 _gelu_approx = functools.partial(jax.nn.gelu, approximate=True)
@@ -39,11 +51,7 @@ _gelu_approx = functools.partial(jax.nn.gelu, approximate=True)
 
 
 class CategorySpecificLinear(nnx.Module):
-    """Linear layer with per-category (embodiment) weight matrices.
-
-    Stores ``num_categories`` separate ``(in, out)`` weight matrices and
-    selects per-sample based on category IDs via index gathering.
-    """
+    """Linear layer with per-category (embodiment) weight matrices."""
 
     def __init__(
         self,
@@ -60,23 +68,15 @@ class CategorySpecificLinear(nnx.Module):
         self.bias = nnx.Param(jnp.zeros((num_categories, output_dim), dtype=param_dtype))
 
     def __call__(self, x: jax.Array, category_ids: jax.Array) -> jax.Array:
-        """
-        Args:
-            x: ``(B, L, in)`` or ``(B, in)``.
-            category_ids: ``(B,)`` int.
-
-        Returns:
-            ``(B, L, out)`` or ``(B, out)``.
-        """
-        W = self.weight[...][category_ids]  # (B, in, out)
-        b = self.bias[...][category_ids]    # (B, out)
+        W = self.weight[...][category_ids]
+        b = self.bias[...][category_ids]
         if x.ndim == 3:
             return jnp.einsum("bli,bio->blo", x, W) + b[:, None, :]
         return jnp.einsum("bi,bio->bo", x, W) + b
 
 
 class CategorySpecificMLP(nnx.Module):
-    """Two-layer MLP with per-category weights: SiLU(Linear1) -> Linear2."""
+    """Two-layer MLP with per-category weights: ReLU(Linear1) -> Linear2."""
 
     def __init__(
         self,
@@ -102,15 +102,7 @@ class CategorySpecificMLP(nnx.Module):
 
 
 class MultiEmbodimentActionEncoder(nnx.Module):
-    """Encode noisy actions + diffusion timestep with embodiment-specific weights.
-
-    ::
-
-        a_emb = W1(actions, cat_ids)
-        tau_emb = sinusoidal(timestep)
-        x = SiLU(W2([a_emb || tau_emb], cat_ids))
-        x = W3(x, cat_ids)
-    """
+    """Encode noisy actions + diffusion timestep with embodiment-specific weights."""
 
     def __init__(
         self,
@@ -141,19 +133,8 @@ class MultiEmbodimentActionEncoder(nnx.Module):
         timesteps: jax.Array,
         category_ids: jax.Array,
     ) -> jax.Array:
-        """
-        Args:
-            actions: ``(B, T, action_dim)`` noisy action sequence.
-            timesteps: ``(B,)`` diffusion timestep.
-            category_ids: ``(B,)`` embodiment IDs.
-
-        Returns:
-            ``(B, T, hidden_size)`` action embeddings.
-        """
         B, T, _ = actions.shape
         a_emb = self.W1(actions, category_ids)
-        # Original uses SinusoidalPositionalEncoding with [sin, cos] order
-        # and (B, T) input (timestep broadcast across T action steps)
         ts_expanded = jnp.broadcast_to(timesteps[:, None], (B, T))
         half = self.hidden_size // 2
         exponent = -jnp.log(10000.0) * jnp.arange(half) / half
@@ -166,7 +147,7 @@ class MultiEmbodimentActionEncoder(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
-# Block-causal mask for action-aware DiT
+# Legacy mask (kept for backward compatibility with tests)
 # ---------------------------------------------------------------------------
 
 
@@ -177,43 +158,19 @@ def make_action_causal_mask(
     num_state_per_block: int,
     has_clean: bool = True,
 ) -> jax.Array:
-    """Build block-causal attention mask for joint video + action training.
+    """Build block-causal attention mask for the OLD interleaved layout.
 
-    Sequence layout::
-
-        [clean_video | noisy_video_0, action_0, state_0, ...,
-                       noisy_video_N, action_N, state_N]
-
-    Attention rules:
-
-    * **clean_video_i** -> all clean_video_j where j <= i.
-    * **noisy_video_i** -> clean_video_j (j <= i), own noisy_video_i,
-      own action_i.
-    * **action_i** -> clean_video_j (j <= i), own noisy_video_i, own action_i.
-    * **state_i** -> own state_i only.
-
-    Args:
-        num_blocks: Number of temporal blocks.
-        block_video_tokens: Video tokens per block
-            (``frame_seqlen * num_frames_per_block``).
-        num_action_per_block: Action tokens per block.
-        num_state_per_block: State tokens per block.
-        has_clean: Whether teacher-forcing clean video is prepended.
-
-    Returns:
-        Boolean mask ``(total_seq, total_seq)`` where True = attend.
+    .. deprecated::
+        CausalWanDiT now uses procedural blockwise attention instead of
+        materialized masks.  Retained only for tests.
     """
-    TYPE_CLEAN = 0
-    TYPE_VIDEO = 1
-    TYPE_ACTION = 2
-    TYPE_STATE = 3
+    TYPE_CLEAN, TYPE_VIDEO, TYPE_ACTION, TYPE_STATE = 0, 1, 2, 3
 
     clean_len = num_blocks * block_video_tokens if has_clean else 0
     block_noisy = block_video_tokens + num_action_per_block + num_state_per_block
 
-    # --- Build block-id and type-id arrays ---
-    parts_block = []
-    parts_type = []
+    parts_block: list[jax.Array] = []
+    parts_type: list[jax.Array] = []
 
     if has_clean:
         parts_block.append(jnp.repeat(jnp.arange(num_blocks), block_video_tokens))
@@ -230,11 +187,8 @@ def make_action_causal_mask(
     block_ids = jnp.concatenate(parts_block)
     type_ids = jnp.concatenate(parts_type)
 
-    # --- Broadcast comparisons ---
-    q_block = block_ids[:, None]
-    k_block = block_ids[None, :]
-    q_type = type_ids[:, None]
-    k_type = type_ids[None, :]
+    q_block, k_block = block_ids[:, None], block_ids[None, :]
+    q_type, k_type = type_ids[:, None], type_ids[None, :]
 
     same_block = q_block == k_block
     k_earlier_or_same = q_block >= k_block
@@ -244,26 +198,17 @@ def make_action_causal_mask(
     is_action_k = k_type == TYPE_ACTION
     is_state_k = k_type == TYPE_STATE
 
-    # Clean video query: attend to earlier/same clean blocks
     clean_rule = is_clean_k & k_earlier_or_same
-
-    # Noisy video / action query: attend to earlier clean + own video/action
     noisy_rule = (is_clean_k & k_earlier_or_same) | (
         (is_video_k | is_action_k) & same_block
     )
-
-    # State query: attend to own state only
     state_rule = is_state_k & same_block
 
-    is_clean_q = q_type == TYPE_CLEAN
-    is_state_q = q_type == TYPE_STATE
-
-    mask = jnp.where(
-        is_clean_q,
+    return jnp.where(
+        q_type == TYPE_CLEAN,
         clean_rule,
-        jnp.where(~is_state_q, noisy_rule, state_rule),
+        jnp.where(q_type != TYPE_STATE, noisy_rule, state_rule),
     )
-    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -274,20 +219,16 @@ def make_action_causal_mask(
 class CausalWanDiT(nnx.Module):
     """Action-aware causal Diffusion Transformer.
 
-    Extends the standard WanDiT with:
+    Sequence layout (appended, matching original DreamZero)::
 
-    * Multi-embodiment action encoder / decoder
-    * State encoder
-    * Block-causal attention for training with teacher forcing
-    * Joint video + action noise prediction
+        [video | action | state]
 
-    Training sequence layout::
+    With teacher forcing::
 
-        [clean_video | noisy_video_0 action_0 state_0 ...
-                       noisy_video_N action_N state_N]
+        [clean_video | noisy_video | action | state]
 
-    Each temporal block ``i`` contains video tokens for one or more frames,
-    the corresponding action tokens, and a state token.
+    Per-token time conditioning: each token gets its own timestep
+    (t_video, t_action, or t_state; clean tokens get t=0).
     """
 
     def __init__(
@@ -308,7 +249,6 @@ class CausalWanDiT(nnx.Module):
         eps: float = 1e-6,
         use_scan: bool = False,
         use_remat: bool = False,
-        # Action-specific
         action_dim: int = 7,
         state_dim: int = 14,
         action_hidden_size: int = 1024,
@@ -330,9 +270,9 @@ class CausalWanDiT(nnx.Module):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.num_frames_per_block = num_frames_per_block
-        head_dim = dim // num_heads
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
 
-        # --- Shared with WanDiT ---
         self.patch_embedding = PatchEmbed3D(
             patch_size=patch_size, in_channels=in_channels, embed_dim=dim,
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
@@ -369,10 +309,8 @@ class CausalWanDiT(nnx.Module):
             dtype=dtype, param_dtype=param_dtype, rngs=rngs,
         )
 
-        # RoPE for video tokens (plain class, not nnx.Module)
-        self.rope = WanRoPE3D(head_dim)
+        self.rope = WanRoPE3D(self.head_dim)
 
-        # --- Action-specific ---
         self.state_encoder = CategorySpecificMLP(
             max_num_embodiments, state_dim, action_hidden_size, dim,
             param_dtype=param_dtype, rngs=rngs,
@@ -385,54 +323,6 @@ class CausalWanDiT(nnx.Module):
             max_num_embodiments, dim, action_hidden_size, action_dim,
             param_dtype=param_dtype, rngs=rngs,
         )
-
-    def _build_combined_rope(
-        self,
-        f: int,
-        h: int,
-        w: int,
-        num_blocks: int,
-        has_clean: bool,
-    ) -> jax.Array:
-        """Assemble RoPE frequencies for the combined interleaved sequence.
-
-        Video tokens use 3D RoPE; action and state tokens use 1D RoPE
-        indexed by block number.
-
-        Returns:
-            Complex array ``(total_seq, head_dim // 2)``.
-        """
-        video_freqs = self.rope(f, h, w)  # (f*h*w, head_dim//2) complex
-        block_video_tokens = self.num_frames_per_block * h * w
-
-        # 1D base frequencies for action/state tokens
-        d = self.rope.head_dim // 2
-        base_freqs = 1.0 / (
-            10000.0 ** (jnp.arange(0, d * 2, 2, dtype=jnp.float32) / (d * 2))
-        )
-
-        parts = []
-        if has_clean:
-            parts.append(video_freqs)
-
-        for i in range(num_blocks):
-            # Video tokens: slice from 3D RoPE
-            vs = i * block_video_tokens
-            parts.append(video_freqs[vs : vs + block_video_tokens])
-
-            # Action tokens: 1D RoPE at position i
-            action_angles = jnp.outer(
-                jnp.full(self.num_action_per_block, float(i)), base_freqs,
-            )
-            parts.append(jnp.exp(1j * action_angles))
-
-            # State tokens: 1D RoPE at position i
-            state_angles = jnp.outer(
-                jnp.full(self.num_state_per_block, float(i)), base_freqs,
-            )
-            parts.append(jnp.exp(1j * state_angles))
-
-        return jnp.concatenate(parts, axis=0)
 
     def __call__(
         self,
@@ -447,139 +337,112 @@ class CausalWanDiT(nnx.Module):
         clip_emb: jax.Array | None = None,
         y: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Joint video + action forward pass.
-
-        Args:
-            x: Noisy video latent ``(B, T, H, W, C)`` where C=16.
-            timestep: Video diffusion timestep ``(B,)``.
-            context: Text embeddings ``(B, L, text_dim)``.
-            state: Robot state ``(B, num_blocks, state_dim)``.
-            embodiment_id: Embodiment IDs ``(B,)`` int.
-            actions: Noisy actions
-                ``(B, num_blocks * num_action_per_block, action_dim)``.
-            timestep_action: Action diffusion timestep ``(B,)``.
-                Defaults to ``timestep`` (coupled noise).
-            clean_x: Clean video for teacher forcing ``(B, T, H, W, C)``
-                or ``None``.
-            clip_emb: CLIP image features ``(B, 257, 1280)`` or ``None``.
-            y: I2V conditioning ``(B, T, H, W, 20)`` — 4ch mask + 16ch
-                first-frame VAE latent. Concatenated with ``x`` (and
-                ``clean_x``) along channels before patch embedding.
-
-        Returns:
-            ``(video_noise_pred, action_noise_pred)`` where
-            ``video_noise_pred`` has shape ``(B, T, H, W, out_channels)`` and
-            ``action_noise_pred`` has shape
-            ``(B, total_actions, action_dim)``.
-        """
+        """Joint video + action forward pass."""
         if timestep_action is None:
             timestep_action = timestep
         has_clean = clean_x is not None
         B = x.shape[0]
 
-        # --- I2V conditioning: concat y along channel axis ---
         if y is not None:
             x = jnp.concatenate([x, y], axis=-1)
 
-        # --- Patch embed noisy video ---
-        x_patched = self.patch_embedding.proj(x)  # (B, f, h, w, dim)
+        x_patched = self.patch_embedding.proj(x)
         _, f, h, w, _ = x_patched.shape
-        x_flat = x_patched.reshape(B, f * h * w, self.dim)
+        seq_len = f * h * w
+        frame_seqlen = h * w
+        x_flat = x_patched.reshape(B, seq_len, self.dim)
 
-        block_video_tokens = self.num_frames_per_block * h * w
-        num_blocks = f // self.num_frames_per_block
-        block_noisy = (
-            block_video_tokens + self.num_action_per_block + self.num_state_per_block
-        )
+        video_freqs = self.rope(f, h, w)[:, None, :]
+        action_freqs = rope_params_polar_1d(1024 * 10, self.head_dim)
+        state_freqs = rope_params_polar_1d(1024, self.head_dim)
 
-        # --- Encode actions & state ---
-        action_emb = self.action_encoder(
-            actions, timestep_action, embodiment_id,
-        )  # (B, total_actions, dim)
-        state_emb = self.state_encoder(
-            state, embodiment_id,
-        )  # (B, num_blocks, dim)
+        action_emb = self.action_encoder(actions, timestep_action, embodiment_id)
+        state_emb = self.state_encoder(state, embodiment_id)
 
-        # --- Interleave noisy section ---
-        noisy_parts: list[jax.Array] = []
-        for i in range(num_blocks):
-            vs = i * block_video_tokens
-            noisy_parts.append(x_flat[:, vs : vs + block_video_tokens])
-            as_ = i * self.num_action_per_block
-            noisy_parts.append(
-                action_emb[:, as_ : as_ + self.num_action_per_block]
-            )
-            noisy_parts.append(state_emb[:, i : i + 1])
-        noisy_seq = jnp.concatenate(noisy_parts, axis=1)
+        action_length = action_emb.shape[1]
+        action_register = jnp.concatenate([action_emb, state_emb], axis=1)
+        action_register_length = action_register.shape[1]
 
-        # --- Teacher forcing: prepend clean video ---
+        x_seq = jnp.concatenate([x_flat, action_register], axis=1)
+
         if has_clean:
             if y is not None:
                 clean_x = jnp.concatenate([clean_x, y], axis=-1)
             clean_patched = self.patch_embedding.proj(clean_x)
-            clean_flat = clean_patched.reshape(B, f * h * w, self.dim)
-            full_seq = jnp.concatenate([clean_flat, noisy_seq], axis=1)
+            clean_flat = clean_patched.reshape(B, seq_len, self.dim)
+            full_seq = jnp.concatenate([clean_flat, x_seq], axis=1)
         else:
-            full_seq = noisy_seq
+            full_seq = x_seq
 
-        # --- Block-causal mask ---
-        mask = make_action_causal_mask(
-            num_blocks, block_video_tokens,
-            self.num_action_per_block, self.num_state_per_block,
-            has_clean=has_clean,
+        ts_video = jnp.broadcast_to(timestep[:, None], (B, seq_len))
+        ts_action = (
+            jnp.broadcast_to(timestep_action[:, None], (B, action_length))
+            if timestep_action.ndim == 1
+            else timestep_action
         )
+        stride = ts_action.shape[1] // state_emb.shape[1]
+        ts_state = ts_action[:, ::stride]
+        ts_full = jnp.concatenate([ts_video, ts_action, ts_state], axis=1)
 
-        # --- RoPE ---
-        freqs_cis = self._build_combined_rope(f, h, w, num_blocks, has_clean)
+        if has_clean:
+            ts_clean = jnp.zeros((B, seq_len), dtype=timestep.dtype)
+            ts_full = jnp.concatenate([ts_clean, ts_full], axis=1)
 
-        # --- Time conditioning ---
-        t = sinusoidal_embedding(timestep, self.freq_dim)
-        t = self.time_embedding(t)
-        e = jax.nn.silu(t)
-        e = self.time_projection(e).reshape(B, 6, self.dim)
+        total_L = full_seq.shape[1]
+        e_flat, e0_flat = per_token_time_conditioning(
+            ts_full.reshape(-1), self.freq_dim,
+            self.time_embedding, self.time_projection, self.dim,
+        )
+        e_tokens = e_flat.reshape(B, total_L, self.dim)
+        e0_tokens = e0_flat.reshape(B, total_L, 6, self.dim)
 
-        # --- Text conditioning ---
         ctx = self.text_embedding(context)
         if self.has_image_input and clip_emb is not None:
             img_ctx = self.img_emb(clip_emb)
             ctx = jnp.concatenate([img_ctx, ctx], axis=1)
 
-        # --- Transformer blocks ---
+        is_tf = has_clean
+
         if self.use_scan:
-            full_seq = _scan_blocks(
-                list(self.blocks), full_seq, e, ctx, freqs_cis, mask=mask,
+            full_seq = causal_scan_blocks(
+                list(self.blocks), full_seq, e0_tokens, ctx,
+                video_freqs, action_freqs, state_freqs,
+                action_register_length, frame_seqlen,
+                self.num_frames_per_block, self.num_action_per_block,
+                self.num_state_per_block, is_tf,
                 use_remat=self.use_remat,
             )
         elif self.use_remat:
-            full_seq = _remat_blocks(
-                list(self.blocks), full_seq, e, ctx, freqs_cis, mask=mask,
+            full_seq = causal_remat_blocks(
+                list(self.blocks), full_seq, e0_tokens, ctx,
+                video_freqs, action_freqs, state_freqs,
+                action_register_length, frame_seqlen,
+                self.num_frames_per_block, self.num_action_per_block,
+                self.num_state_per_block, is_tf,
             )
         else:
             for block in self.blocks:
-                full_seq = block(full_seq, e, ctx, freqs_cis, mask=mask)
+                full_seq = causal_block_forward(
+                    block, full_seq, e0_tokens, ctx,
+                    video_freqs, action_freqs, state_freqs,
+                    action_register_length, frame_seqlen,
+                    self.num_frames_per_block, self.num_action_per_block,
+                    self.num_state_per_block, is_tf,
+                )
 
-        # --- Extract video and action predictions ---
-        clean_len = f * h * w if has_clean else 0
-        noisy_section = full_seq[:, clean_len:]
+        if has_clean:
+            full_seq = full_seq[:, seq_len:]
 
-        # Index arrays for video and action tokens within the noisy section
-        block_offsets = jnp.arange(num_blocks) * block_noisy
-        video_within = jnp.arange(block_video_tokens)
-        video_indices = (block_offsets[:, None] + video_within[None, :]).ravel()
+        video_pred = full_seq[:, :seq_len]
+        action_pred = full_seq[:, seq_len:seq_len + action_length]
 
-        action_within = jnp.arange(self.num_action_per_block) + block_video_tokens
-        action_indices = (block_offsets[:, None] + action_within[None, :]).ravel()
-
-        video_pred = noisy_section[:, video_indices]    # (B, f*h*w, dim)
-        action_pred = noisy_section[:, action_indices]  # (B, total_actions, dim)
-
-        # Video output head
-        video_noise_pred = self.head(video_pred, t)
+        offset = seq_len if has_clean else 0
+        e_video = e_tokens[:, offset:offset + seq_len]
+        video_noise_pred = head_forward_per_token(self.head, video_pred, e_video)
         video_noise_pred = unpatchify(
             video_noise_pred, (f, h, w), self.patch_size, self.out_channels,
         )
 
-        # Action output
         action_noise_pred = self.action_decoder(action_pred, embodiment_id)
 
         return video_noise_pred, action_noise_pred

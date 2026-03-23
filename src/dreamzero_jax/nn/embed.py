@@ -386,3 +386,22 @@ class WanRoPE3D:
 
         freqs = jnp.concatenate([freqs_f, freqs_h, freqs_w], axis=-1)  # (f*h*w, d)
         return jnp.exp(1j * freqs)
+
+
+def rope_params_polar_1d(max_seq_len: int, head_dim: int, theta: float = 10000.0) -> jax.Array:
+    """Precompute 1D polar RoPE table matching the original ``rope_params_polar``.
+
+    Uses float64 for angle computation then converts to complex128, matching
+    the PyTorch reference which uses ``torch.float64``.
+
+    Returns:
+        Complex array ``(max_seq_len, head_dim // 2)``.
+    """
+    d = head_dim
+    freqs = 1.0 / jnp.power(
+        theta,
+        jnp.arange(0, d, 2, dtype=jnp.float64) / d,
+    )
+    positions = jnp.arange(max_seq_len, dtype=jnp.float64)
+    angles = jnp.outer(positions, freqs)
+    return jnp.exp(1j * angles)
